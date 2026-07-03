@@ -1,0 +1,35 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: cambium
+
+      # sibling checkout so the REAL agentsync integration test runs in CI
+      - uses: actions/checkout@v5
+        with:
+          repository: jarmstrong158/agentsync
+          path: agentsync
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r cambium/requirements.txt
+
+      - name: Configure git identity
+        run: |
+          git config --global user.name  "ci"
+          git config --global user.email "ci@cambium.test"
+          git config --global init.defaultBranch main
+
+      - name: Run test suite
+        run: python cambium/test_cambium.py
