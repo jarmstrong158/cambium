@@ -77,6 +77,20 @@ a session-end / post-commit hook can run it unconditionally. The burden left
 is one hook configuration, once. distill deliberately imports each source
 record at most once (watermarks in the local store) so hooks can fire freely.
 
+A wrinkle the substrate forces: agentsync keys claims by agent id and deletes a
+claim from live state the moment it is released or re-claimed, and it exposes no
+hook or event — only the rewritten `claims.json`. So the classic "read the
+current done claims" distill loses any claim that completes and churns before it
+runs. `CAMBIUM_RELEASE_CAPTURE=1` (opt-in — default behaviour must not change
+silently) adds a *last-seen snapshot* of each agent's claim to the local store;
+each sweep diffs live claims against it and captures anything that has churned
+away, from the snapshot, through the **same** watermark path — no second dedupe.
+The design choice is deliberate about what it does *not* promise: this is
+capture at the moments distill runs, not exhaustive history reconstruction. The
+honest residual gap — a done state born and gone between two sweeps — is
+recoverable only from agentsync's git log (which `history()` proves survives);
+walking it is a viable follow-up, not smuggled into this change.
+
 ## Decision 5 — recall abstains instead of confabulating
 
 Borrowed from context-keeper v0.10 (which measured 100% confabulation on

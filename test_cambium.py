@@ -33,6 +33,7 @@ AGENTSYNC_PATH = os.path.join(os.path.dirname(HERE), "agentsync",
 CAMBIUM_ENV = [
     "CAMBIUM_REPO", "CAMBIUM_AGENT_ID", "CAMBIUM_ORG_REPO", "CAMBIUM_ORG_PR",
     "CAMBIUM_PROMOTE_RECALLS", "CAMBIUM_TEAM_BRANCH", "CAMBIUM_AGENTSYNC_BRANCH",
+    "CAMBIUM_RELEASE_CAPTURE",
 ]
 
 
@@ -115,6 +116,20 @@ def seed_agentsync_branch(clone, claims):
         json.dump({"claims": claims}, f, indent=2)
     git(["add", "claims.json"], clone)
     git(["commit", "-qm", "agentsync: seed"], clone)
+    git(["push", "-q", "origin", "agentsync"], clone)
+    git(["checkout", "-q", "main"], clone)
+
+
+def rewrite_agentsync_claims(clone, claims):
+    """Rewrite claims.json on the existing 'agentsync' branch and push — the
+    churn a live agentsync produces as claims are released (pop) or re-claimed
+    (overwrite) under an agent id."""
+    git(["fetch", "-q", "origin", "agentsync"], clone)
+    git(["checkout", "-qB", "agentsync", "origin/agentsync"], clone)
+    with open(os.path.join(clone, "claims.json"), "w") as f:
+        json.dump({"claims": claims}, f, indent=2)
+    git(["add", "claims.json"], clone)
+    git(["commit", "-qm", "agentsync: churn"], clone)
     git(["push", "-q", "origin", "agentsync"], clone)
     git(["checkout", "-q", "main"], clone)
 
@@ -271,6 +286,94 @@ def test_distill_reports_missing_substrates():
         assert r["new_items"] == 0, r
         assert "no coordination branch" in r["sources"]["agentsync"], r
         assert "no .context" in r["sources"]["context_keeper"], r
+
+
+# --------------------------------------------------------------------------- #
+# release-time capture (opt-in) — capture a claim at its done/released
+# transition, before agentsync churns it out of live state
+# --------------------------------------------------------------------------- #
+def test_release_capture_is_off_by_default():
+    """A live claim released without a full distill catching it is lost unless
+    the flag is on — the default must not silently change."""
+    with lab() as (root, origin, clones):
+        st = clones["stobie"]
+        seed_agentsync_branch(st, {"stobie": DONE_CLAIM})
+        be(clones, "jonny")                          # no flag
+        first = json.loads(M.distill())
+        assert first["release_capture"] is False, first
+        assert first["new_items"] == 1, first        # done claim caught live
+        # nothing snapshotted when off -> a churn is not reconstructed
+        rewrite_agentsync_claims(st, {})             # stobie released
+        after = json.loads(M.distill())
+        assert after["released_captured"] == 0, after
+        assert M._read_local(M._cfg())["imported"]["agentsync_last"] == {}, after
+
+
+def test_release_capture_survives_reclaim_churn():
+    """A done claim that is captured, then re-claimed away before any further
+    distill, stays captured exactly once — not lost, not duplicated."""
+    with lab() as (root, origin, clones):
+        st = clones["stobie"]
+        seed_agentsync_branch(st, {"stobie": DONE_CLAIM})
+        be(clones, "jonny", CAMBIUM_RELEASE_CAPTURE="1")
+        first = json.loads(M.distill())
+        assert first["release_capture"] is True, first
+        outcomes = [i for i in first["items"] if i["kind"] == "outcome"]
+        assert len(outcomes) == 1 and "argon2id" in outcomes[0]["content"], first
+
+        # stobie re-claims brand-new work: the done claim is overwritten out of
+        # live state (agentsync keys by agent id) before another distill runs
+        reclaim = {"task": "billing refactor", "touches": ["billing.py"],
+                   "requires": [], "branch": "stobie/billing",
+                   "status": "in-progress",
+                   "updated_at": "2026-07-02T00:00:00+00:00",
+                   "instance": "def67890", "note": None, "changed_files": []}
+        rewrite_agentsync_claims(st, {"stobie": reclaim})
+        churned = json.loads(M.distill())
+        assert churned["new_items"] == 0, churned          # not re-captured
+        auth = [i for i in M._read_local(M._cfg())["items"]
+                if i["kind"] == "outcome" and "argon2id" in i["content"]]
+        assert len(auth) == 1, "first completion captured exactly once"
+
+        # a later full distill still never duplicates it
+        again = json.loads(M.distill())
+        assert again["new_items"] == 0, again
+        auth = [i for i in M._read_local(M._cfg())["items"]
+                if i["kind"] == "outcome" and "argon2id" in i["content"]]
+        assert len(auth) == 1, again
+
+
+def test_release_capture_grabs_noted_claim_a_full_distill_would_miss():
+    """A claim carrying a reconciliation note but released before ever reaching
+    'done' is invisible to a full distill (which reads only done claims).
+    Release-time capture keeps it via the last-seen snapshot."""
+    with lab() as (root, origin, clones):
+        st = clones["stobie"]
+        noted = {"task": "cache spike", "touches": ["cache.py"], "requires": [],
+                 "branch": "stobie/cache", "status": "in-progress",
+                 "updated_at": "2026-07-01T00:00:00+00:00", "instance": "aaa11111",
+                 "note": "redis TTL must be >= 300s or the stampede returns",
+                 "changed_files": []}
+        seed_agentsync_branch(st, {"stobie": noted})
+
+        # flag on: first sweep records the snapshot; nothing captured yet
+        # (the claim is live and not done)
+        be(clones, "jonny", CAMBIUM_RELEASE_CAPTURE="1")
+        seed = json.loads(M.distill())
+        assert seed["new_items"] == 0, seed
+        assert "stobie" in M._read_local(M._cfg())["imported"]["agentsync_last"]
+
+        # stobie releases the claim — agentsync pops it entirely
+        rewrite_agentsync_claims(st, {})
+        got = json.loads(M.distill())
+        assert got["released_captured"] == 1, got
+        caps = [i for i in got["items"] if "redis TTL" in i["content"]]
+        assert caps and caps[0]["content"].startswith("[stobie] released"), got
+
+        # recallable, and re-distill does not duplicate
+        rec = json.loads(M.recall("redis cache TTL stampede"))
+        assert rec["results"] and "redis TTL" in rec["results"][0]["content"], rec
+        assert json.loads(M.distill())["new_items"] == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -525,6 +628,53 @@ def test_real_agentsync_integration():
         os.environ.pop("AGENTSYNC_AGENT_ID", None)
 
 
+def test_real_agentsync_release_capture():
+    """Release-time capture over the REAL agentsync seam: stobie completes work,
+    then releases and re-claims through agentsync's own tools; the completion is
+    captured once at its transition and never lost or duplicated."""
+    if not os.path.exists(AGENTSYNC_PATH):
+        print("SKIP  test_real_agentsync_release_capture (agentsync repo not found)")
+        return
+    A = load_module("agentsync_server", AGENTSYNC_PATH)
+    with lab() as (root, origin, clones):
+        def as_stobie():
+            os.environ["AGENTSYNC_REPO"] = clones["stobie"]
+            os.environ["AGENTSYNC_AGENT_ID"] = "stobie"
+
+        # stobie finishes real work through real agentsync tools
+        as_stobie()
+        assert json.loads(A.claim("payments", ["pay.py"],
+                                  branch="stobie/pay"))["status"] == "claimed"
+        assert json.loads(A.update_status(
+            "done", note="stripe webhooks verified via signature header"
+        ))["status"] == "updated"
+
+        # jonny's cambium, release-capture on, observes the done claim live
+        be(clones, "jonny", CAMBIUM_RELEASE_CAPTURE="1")
+        first = json.loads(M.distill())
+        assert first["new_items"] == 1, first
+
+        # stobie churns: real release (pops the claim), then re-claims new work
+        as_stobie()
+        assert json.loads(A.release())["status"] in ("released", "updated"), "release"
+        assert json.loads(A.claim("refunds", ["refunds.py"],
+                                  branch="stobie/refunds"))["status"] == "claimed"
+
+        # the completed payments work is captured exactly once — not lost to the
+        # churn, not duplicated by the re-run
+        be(clones, "jonny", CAMBIUM_RELEASE_CAPTURE="1")
+        churned = json.loads(M.distill())
+        assert churned["new_items"] == 0, churned
+        pays = [i for i in M._read_local(M._cfg())["items"]
+                if i["kind"] == "outcome" and "signature" in i["content"]]
+        assert len(pays) == 1, "stripe outcome captured exactly once"
+        rec = json.loads(M.recall("how are stripe webhooks verified"))
+        assert rec["results"] and "signature" in rec["results"][0]["content"], rec
+
+        os.environ.pop("AGENTSYNC_REPO", None)
+        os.environ.pop("AGENTSYNC_AGENT_ID", None)
+
+
 # --------------------------------------------------------------------------- #
 # real MCP stdio transport — the server as a client actually runs it
 # --------------------------------------------------------------------------- #
@@ -590,6 +740,9 @@ TESTS = [
     test_distill_from_context_keeper,
     test_distill_is_idempotent,
     test_distill_reports_missing_substrates,
+    test_release_capture_is_off_by_default,
+    test_release_capture_survives_reclaim_churn,
+    test_release_capture_grabs_noted_claim_a_full_distill_would_miss,
     test_promote_local_to_team_by_recalls,
     test_endorse_fast_tracks_promotion,
     test_promote_explicit_id_respects_threshold_and_force,
@@ -601,6 +754,7 @@ TESTS = [
     test_team_cas_survives_concurrent_push,
     test_status_overview,
     test_real_agentsync_integration,
+    test_real_agentsync_release_capture,
     test_mcp_transport_capture_distill_recall,
 ]
 
