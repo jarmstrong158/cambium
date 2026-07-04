@@ -109,6 +109,10 @@ Walking that log to reconstruct such claims exhaustively is a possible
 follow-up (the history survives — agentsync's `history()` reads it), deliberately
 left out of this change.
 
+**`import_memory(source, path)`** — ingest an external memory export into
+cambium as local-scope, provenance-tagged knowledge items (see **Import**
+below). Read-only against the source; imported items are not auto-promoted.
+
 **`recall(query, scope, limit)`** — federated search across local+team+org.
 Every hit increments the item's recall counter (the trust signal promotion
 feeds on) and records cross-project use. Abstains honestly: below the relevance
@@ -148,18 +152,78 @@ post-commit hook) with `CAMBIUM_RELEASE_CAPTURE=1` and finished agentsync work
 is captured at the moment it completes, before a release or re-claim can erase
 it.
 
+## Import
+
+`import_memory(source, path)` ingests knowledge from an **external** memory
+system into cambium. It is import/ingest **only** — it reads the external store
+and writes cambium items; it never writes back to the source (export is a
+separate, riskier feature and is deliberately out of scope). Import is modelled
+as a **source adapter**, the same shape as distill's substrate readers: an
+adapter reads records from a source location and yields normalized cambium
+knowledge items, which land through the *same* normalize-and-write/dedupe path
+distill uses — no second mechanism.
+
+What import guarantees:
+
+- **Local scope, always.** Imported items enter at `local` scope. They have not
+  earned promotion inside cambium and are **not** auto-promoted — team/org is
+  still earned the normal way, through `recall()` usage and `endorse()`.
+- **Provenance, always.** Every imported item is stamped
+  `source: {system, ref, imported: true, source_ts}` and tagged `imported`, so
+  imported knowledge is distinguishable from natively-distilled capture and
+  auditable back to its origin (system + original id + original timestamp).
+- **Idempotent.** Re-importing the same records adds nothing — dedupe is by the
+  source record's stable id when present, else by a content hash, routed through
+  the shared watermark path.
+- **Read-only against the source**, and dependency-free (stdlib, local files
+  only — no network, no external auth).
+
+### The `json` adapter (reference)
+
+The one bundled adapter reads a **generic JSON / JSONL memory export from a
+local file** — no service-specific coupling. It accepts a top-level array, an
+object wrapping a list under `memories`/`items`/`records`/`data`/`entries`, or
+JSONL (one JSON object per line). Each record maps as:
+
+| cambium field | source keys (first present wins) | if absent |
+|---|---|---|
+| `content` (body) | `content`, `text`, `body`, `memory`, `note` | **record skipped** (no body) |
+| — folded into body | `title`, `name`, `summary` | omitted |
+| `why` | `why`, `reason`, `rationale`, `context` | empty |
+| `kind` | `kind`, `type`, `category` | `"note"` |
+| `tags` | `tags` (list or comma/space string) | just `imported`, `json` |
+| `source.ref` | `id`, `uuid`, `_id`, `key` | content-hash dedupe instead |
+| `source.source_ts` | `timestamp`, `created_at`, `ts`, `time`, `date` | omitted |
+
+`type` is always `memory`; malformed lines and records with no usable body are
+counted as **skipped**, never crash the import. The return value summarizes
+`imported` / `skipped` / `duplicates`.
+
+```bash
+# import_memory(source="json", path="/abs/path/to/export.jsonl")
+```
+
+**Adapters are the extension point.** `json` is the only format shipped — this
+is not a claim of support for any particular memory product. To ingest another
+system, add one adapter (a generator yielding normalized items) to
+`IMPORT_ADAPTERS`; core logic doesn't change. Adapters that require network
+access or credentials are intentionally not included here.
+
 ## Test
 
 ```bash
 python3 test_cambium.py
 ```
 
-24 cases against real git repos: capture/recall (+ honest abstention),
+31 cases against real git repos: capture/recall (+ honest abstention),
 distill from both substrates (exact agentsync claims format; exact
 context-keeper `.context/` schema) with idempotency, **release-time capture**
 (off by default; a done claim survives a re-claim churn captured exactly once;
 a noted claim released before it reaches *done* is kept where a full distill
-would miss it), the full promotion lifecycle (recall-threshold, endorsement
+would miss it), **import** (JSON + JSONL export → provenance-tagged local items,
+re-import dedupes, content-hash fallback without ids, malformed/missing fields
+skipped not crashed, imported items stay local and unpromoted, source left
+untouched), the full promotion lifecycle (recall-threshold, endorsement
 fast-track, org-requires-endorsement, PR-mode with `gh` stubbed), cross-project
 trust tracking, team-write CAS under a concurrent peer push, **two
 real-agentsync integration tests** (drive the actual agentsync claim / finish /

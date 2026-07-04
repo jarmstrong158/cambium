@@ -199,8 +199,10 @@ def _empty_local():
     # imported.agentsync        : sha1 watermarks — the single dedupe path
     # imported.agentsync_last   : last-seen claim per agent, for release-time
     #                             transition detection (see distill())
+    # imported.import           : watermarks for external memory imports
     return {"items": [],
-            "imported": {"context_keeper": [], "agentsync": [], "agentsync_last": {}}}
+            "imported": {"context_keeper": [], "agentsync": [],
+                         "agentsync_last": {}, "import": []}}
 
 
 def _read_local(cfg):
@@ -217,6 +219,7 @@ def _read_local(cfg):
     data["imported"].setdefault("context_keeper", [])
     data["imported"].setdefault("agentsync", [])
     data["imported"].setdefault("agentsync_last", {})
+    data["imported"].setdefault("import", [])
     return data
 
 
@@ -506,16 +509,26 @@ def _agentsync_item(cfg, agent, claim):
     return item, key
 
 
-def _capture_claim(data, imported_as, new_items, item, key):
-    """Import an outcome once. Reuses the single agentsync watermark path, so
-    the same claim caught at release time and again in a later full distill
-    never double-imports."""
-    if key in imported_as:
-        return
-    imported_as.add(key)
+def _ingest(data, bucket, seen, new_items, item, key):
+    """The single normalize-and-write step every source shares: dedupe `key`
+    against the per-source watermark list, append the item to the store, record
+    the watermark. Returns False if the key was already seen (a duplicate).
+    distill's passes and import_memory all route through here — one write/dedupe
+    mechanism, one place items enter the store."""
+    if key in seen:
+        return False
+    seen.add(key)
     data["items"].append(item)
-    data["imported"]["agentsync"].append(key)
+    data["imported"][bucket].append(key)
     new_items.append(item)
+    return True
+
+
+def _capture_claim(data, imported_as, new_items, item, key):
+    """Import an agentsync outcome once, through the shared ingest path, so the
+    same claim caught at release time and again in a later full distill never
+    double-imports."""
+    _ingest(data, "agentsync", imported_as, new_items, item, key)
 
 
 def _claim_ident(claim):
@@ -531,6 +544,122 @@ def _claim_snapshot(claim):
     outcome after it churns out of live state."""
     return {k: claim.get(k) for k in
             ("task", "branch", "status", "note", "changed_files")}
+
+
+# --------------------------------------------------------------------------- #
+# import — external memory stores, ingested as a source adapter
+#
+# An import source adapter is a generator:  adapter(cfg, path) -> yields
+#   * a normalized cambium item dict for each usable record, or
+#   * None for a record it cannot map (counted as skipped)
+# It reads the source READ-ONLY and never writes; dedupe and persistence belong
+# to import_memory via the shared _ingest path. One adapter = one external
+# format. Register new formats in IMPORT_ADAPTERS; core logic never changes.
+# --------------------------------------------------------------------------- #
+def _first_str(rec, keys):
+    """First non-empty value among `keys`, coerced to a trimmed string. Numbers
+    are accepted (e.g. epoch timestamps); everything else must be a real str."""
+    for k in keys:
+        v = rec.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return str(v)
+    return ""
+
+
+def _imported_item(cfg, content, kind, why, tags, system, source_id, source_ts):
+    """Build a cambium item from an external record with provenance stamped:
+    source.imported=True plus the origin system, original id, and original
+    timestamp — so imported knowledge is never mistaken for native capture and
+    stays auditable back to where it came from."""
+    src = {"system": system, "ref": source_id or "", "imported": True}
+    if source_ts:
+        src["source_ts"] = source_ts
+    all_tags = _parse_tags(tags) + ["imported", system]
+    # scope is local by construction (_new_item) — imported items have not
+    # earned promotion in cambium; that must still be earned the normal way.
+    return _new_item(cfg, content, "memory", kind or "note", why or "",
+                     all_tags, src)
+
+
+def _import_key(item):
+    """Stable dedupe watermark for an imported item: the source system + its
+    original id when present, else a content hash. Re-importing the same record
+    is therefore a no-op."""
+    src = item.get("source", {})
+    system = src.get("system", "?")
+    ref = src.get("ref") or ""
+    if ref:
+        return f"{system}:{ref}"
+    digest = hashlib.sha1(item.get("content", "").encode()).hexdigest()[:12]
+    return f"{system}:h:{digest}"
+
+
+def _read_json_records(path):
+    """Read a JSON or JSONL memory export into a list of raw records, read-only.
+    Accepts a top-level array, an object wrapping a list under a common key, a
+    single record object, or JSONL (one JSON value per line). A malformed JSONL
+    line becomes a None record (skipped downstream) rather than aborting the
+    whole import."""
+    with open(path, encoding="utf-8") as f:
+        raw = f.read().strip()
+    if not raw:
+        return []
+    try:
+        doc = json.loads(raw)
+    except json.JSONDecodeError:
+        doc = None
+    if doc is not None:
+        if isinstance(doc, list):
+            return doc
+        if isinstance(doc, dict):
+            for k in ("memories", "items", "records", "data", "entries"):
+                if isinstance(doc.get(k), list):
+                    return doc[k]
+            return [doc]
+        return []
+    records = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            records.append(None)
+    return records
+
+
+def _adapter_json(cfg, path):
+    """Reference adapter: a generic JSON / JSONL export of memory records. Each
+    record is an object with a text body under content/text/body/memory/note
+    (required — records without it are skipped) plus optional title, why, kind,
+    tags, id, and timestamp. Maps those onto cambium fields; missing fields fall
+    back to sensible defaults rather than being guessed."""
+    for rec in _read_json_records(path):
+        if not isinstance(rec, dict):
+            yield None
+            continue
+        content = _first_str(rec, ("content", "text", "body", "memory", "note"))
+        if not content:
+            yield None  # no usable body — nothing to distill
+            continue
+        title = _first_str(rec, ("title", "name", "summary"))
+        if title and title not in content:
+            content = f"{title} — {content}"
+        why = _first_str(rec, ("why", "reason", "rationale", "context"))
+        kind = _first_str(rec, ("kind", "type", "category")) or "note"
+        source_id = _first_str(rec, ("id", "uuid", "_id", "key"))
+        source_ts = _first_str(rec, ("timestamp", "created_at", "ts", "time",
+                                     "date"))
+        yield _imported_item(cfg, content, kind, why, rec.get("tags", []),
+                             "json", source_id, source_ts)
+
+
+IMPORT_ADAPTERS = {
+    "json": _adapter_json,   # generic JSON / JSONL memory export (local file)
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -690,6 +819,68 @@ def distill() -> str:
                 "context_keeper": "read" if ck_seen else "no .context/ store found",
             },
             "items": [{"id": i["id"], "kind": i["kind"], "content": i["content"]}
+                      for i in new_items],
+        },
+        indent=2,
+    )
+
+
+@mcp.tool()
+def import_memory(source: str, path: str) -> str:
+    """Ingest an external memory export into cambium as LOCAL-scope, provenance-
+    tagged knowledge items — a source adapter alongside distill's substrate
+    readers. Import/ingest only: it reads the source READ-ONLY and never writes
+    back to it.
+
+    source : adapter name. 'json' = a generic JSON/JSONL export — a list of
+             records (or an object wrapping one under memories/items/records),
+             each with a text body (content/text/body/memory/note) plus optional
+             title, why, kind, tags, id, timestamp. It's the extension point:
+             new formats are new adapters, no core changes.
+    path   : local file path to read (no network, no external auth).
+
+    Every item is stamped with provenance (source.imported=True, the origin
+    system, original id + timestamp) so imports never masquerade as native
+    capture. Idempotent — re-importing the same records adds nothing (dedupe by
+    source id, or content hash when no id). Imported items are NOT auto-promoted;
+    they earn team/org the normal way, through recall usage and endorsement.
+
+    Returns a summary: imported / skipped / duplicates."""
+    cfg = _cfg()
+    adapter = IMPORT_ADAPTERS.get(source)
+    if adapter is None:
+        return json.dumps({"error": f"unknown source '{source}'. available: "
+                           f"{', '.join(sorted(IMPORT_ADAPTERS))}"})
+    if not path or not os.path.isfile(path):
+        return json.dumps({"error": f"no readable file at path: {path!r}"})
+
+    data = _read_local(cfg)
+    seen = set(data["imported"]["import"])
+    new_items = []
+    imported = skipped = duplicates = 0
+    try:
+        for item in adapter(cfg, path):
+            if item is None:
+                skipped += 1
+                continue
+            if _ingest(data, "import", seen, new_items, item, _import_key(item)):
+                imported += 1
+            else:
+                duplicates += 1
+    except (OSError, ValueError) as e:
+        return json.dumps({"error": f"could not read source {path!r}: {e}"})
+
+    _write_local(cfg, data)
+    return json.dumps(
+        {
+            "status": "imported",
+            "source": source,
+            "scope": "local",
+            "imported": imported,
+            "skipped": skipped,
+            "duplicates": duplicates,
+            "items": [{"id": i["id"], "kind": i["kind"],
+                       "content": i["content"][:80], "source": i["source"]}
                       for i in new_items],
         },
         indent=2,
@@ -972,7 +1163,8 @@ def status() -> str:
             "scopes": {"local": count(local["items"]), "team": count(team),
                        "org": count(org) if cfg["org_repo"] else "not configured"},
             "imported": {"context_keeper": len(local["imported"]["context_keeper"]),
-                         "agentsync": len(local["imported"]["agentsync"])},
+                         "agentsync": len(local["imported"]["agentsync"]),
+                         "import": len(local["imported"]["import"])},
             "substrates": {
                 "agentsync_branch": cfg["agentsync_branch"],
                 "context_dir": os.path.isdir(cfg["context_dir"]),

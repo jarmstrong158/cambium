@@ -113,6 +113,13 @@ embeddings are a swap-in behind the same contract.
   context-keeper owns its files; cambium never writes `.context/`.
 - **Semantic conflict/downgrade detection** — deprecation is manual (set
   `status: "deprecated"` — items are human-editable JSON by design).
+- **Export to external memory systems** — `import_memory` ingests *from* an
+  external store *into* cambium (a source adapter, same shape as distill's
+  substrate readers, routed through the same normalize-and-write/dedupe path).
+  The reverse — cambium writing into external systems — is a separate, riskier
+  feature (it mutates someone else's store) and is deliberately out of scope.
+  Imported items are provenance-stamped (`source.imported`) and land at local
+  scope; they earn promotion the normal way, never automatically.
 
 ## Failure notes
 

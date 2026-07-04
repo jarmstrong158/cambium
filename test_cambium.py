@@ -377,6 +377,134 @@ def test_release_capture_grabs_noted_claim_a_full_distill_would_miss():
 
 
 # --------------------------------------------------------------------------- #
+# import — ingest an external memory export as a source adapter
+# --------------------------------------------------------------------------- #
+def _write_text(path, text):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def _write_json(path, obj):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
+
+
+def test_import_json_array_maps_to_items_with_provenance():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        src = os.path.join(root, "memories.json")
+        _write_json(src, [
+            {"id": "m1", "title": "Deploy window",
+             "content": "Deploys go out Tuesdays 10am UTC",
+             "why": "avoids Friday incidents", "tags": ["deploy", "process"],
+             "timestamp": "2026-05-01T00:00:00Z"},
+            {"id": "m2", "text": "Postgres connection cap is 90",
+             "tags": "db,postgres"},
+        ])
+        r = json.loads(M.import_memory("json", src))
+        assert r["status"] == "imported", r
+        assert (r["imported"], r["skipped"], r["duplicates"]) == (2, 0, 0), r
+        assert r["scope"] == "local", r
+
+        items = M._read_local(M._cfg())["items"]
+        assert len(items) == 2, items
+        m1 = next(i for i in items if i["source"]["ref"] == "m1")
+        # imported items are local scope, never anything else on import
+        assert m1["scope"] == "local", m1
+        # provenance: marked imported, origin system + original id + timestamp
+        assert m1["source"]["imported"] is True, m1
+        assert m1["source"]["system"] == "json", m1
+        assert m1["source"]["source_ts"] == "2026-05-01T00:00:00Z", m1
+        # field mapping: title folded into body, why + tags carried over
+        assert "Deploy window" in m1["content"] and "Tuesdays" in m1["content"], m1
+        assert m1["why"] == "avoids Friday incidents", m1
+        assert "imported" in m1["tags"] and "deploy" in m1["tags"], m1
+        # a record with only a bare 'text' field still maps
+        m2 = next(i for i in items if i["source"]["ref"] == "m2")
+        assert "Postgres" in m2["content"] and "postgres" in m2["tags"], m2
+        # imported knowledge is recallable like any other
+        rec = json.loads(M.recall("when do deploys go out"))
+        assert rec["results"] and "Tuesdays" in rec["results"][0]["content"], rec
+
+
+def test_import_jsonl_and_reimport_is_idempotent():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        src = os.path.join(root, "memories.jsonl")
+        _write_text(src,
+                    '{"id": "a", "content": "use ruff for linting"}\n'
+                    '{"id": "b", "content": "prefer pathlib over os.path"}\n')
+        first = json.loads(M.import_memory("json", src))
+        assert first["imported"] == 2, first
+        # re-importing the same source adds nothing — routed through the same
+        # watermark path distill uses
+        again = json.loads(M.import_memory("json", src))
+        assert (again["imported"], again["duplicates"]) == (0, 2), again
+        assert len(M._read_local(M._cfg())["items"]) == 2
+
+
+def test_import_dedupes_by_content_when_no_id():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        src = os.path.join(root, "noids.json")
+        _write_json(src, [{"text": "dedupe me by content hash"},
+                          {"text": "dedupe me by content hash"}])
+        r = json.loads(M.import_memory("json", src))
+        assert (r["imported"], r["duplicates"]) == (1, 1), r
+
+
+def test_import_handles_malformed_and_missing_fields():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        src = os.path.join(root, "messy.jsonl")
+        _write_text(src,
+                    '{"id": "ok", "content": "keep me"}\n'
+                    'not valid json at all\n'          # unparseable line -> skip
+                    '{"id": "empty", "content": ""}\n'  # empty body -> skip
+                    '"a bare string, not an object"\n'  # not a dict -> skip
+                    '{"id": "notext", "tags": ["x"]}\n')  # no body -> skip
+        r = json.loads(M.import_memory("json", src))
+        assert r["imported"] == 1, r
+        assert r["skipped"] == 4, r
+        items = M._read_local(M._cfg())["items"]
+        assert len(items) == 1 and items[0]["content"] == "keep me", items
+
+
+def test_import_rejects_unknown_source_and_missing_file():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        assert "error" in json.loads(M.import_memory("notes-app", "/whatever")), \
+            "unknown adapter must error, not guess"
+        assert "error" in json.loads(
+            M.import_memory("json", os.path.join(root, "nope.json")))
+
+
+def test_import_is_read_only_against_source():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        src = os.path.join(root, "immutable.json")
+        _write_json(src, [{"id": "z", "content": "source stays untouched"}])
+        before = open(src, encoding="utf-8").read()
+        M.import_memory("json", src)
+        after = open(src, encoding="utf-8").read()
+        assert before == after, "import must never mutate the source"
+
+
+def test_import_items_are_not_auto_promoted():
+    with lab() as (root, origin, clones):
+        # threshold of 1 recall would promote easily — but import grants none
+        be(clones, "jonny", CAMBIUM_PROMOTE_RECALLS="1")
+        src = os.path.join(root, "mem.json")
+        _write_json(src, [{"id": "p", "content": "imported wisdom stays local"}])
+        M.import_memory("json", src)
+        rp = json.loads(M.review_promotions())
+        assert rp["eligible_for_team"] == [], rp   # 0 recalls, 0 endorsements
+        assert all(i["scope"] == "local"
+                   for i in M._read_local(M._cfg())["items"])
+        assert M._read_team(M._cfg()) == []
+
+
+# --------------------------------------------------------------------------- #
 # promotion lifecycle
 # --------------------------------------------------------------------------- #
 def test_promote_local_to_team_by_recalls():
@@ -743,6 +871,13 @@ TESTS = [
     test_release_capture_is_off_by_default,
     test_release_capture_survives_reclaim_churn,
     test_release_capture_grabs_noted_claim_a_full_distill_would_miss,
+    test_import_json_array_maps_to_items_with_provenance,
+    test_import_jsonl_and_reimport_is_idempotent,
+    test_import_dedupes_by_content_when_no_id,
+    test_import_handles_malformed_and_missing_fields,
+    test_import_rejects_unknown_source_and_missing_file,
+    test_import_is_read_only_against_source,
+    test_import_items_are_not_auto_promoted,
     test_promote_local_to_team_by_recalls,
     test_endorse_fast_tracks_promotion,
     test_promote_explicit_id_respects_threshold_and_force,
