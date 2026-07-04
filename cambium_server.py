@@ -46,6 +46,10 @@ Config (environment, set in the MCP client config)
     CAMBIUM_ORG_REPO         path to the org knowledge repo clone   (optional)
     CAMBIUM_ORG_PR           "1" = promote to org via pull request  (default: direct push)
     CAMBIUM_PROMOTE_RECALLS  recalls needed for local->team         (default: 3)
+    CAMBIUM_RELEASE_CAPTURE  "1" = capture agentsync claims at the
+                             done/released transition, not only when a
+                             full distill happens to catch them live
+                                                                    (default: off)
 """
 
 import hashlib
@@ -107,6 +111,7 @@ def _cfg():
         "agentsync_branch": os.environ.get("CAMBIUM_AGENTSYNC_BRANCH", "agentsync"),
         "org_repo": os.path.abspath(org) if org else "",
         "org_pr": os.environ.get("CAMBIUM_ORG_PR", "") == "1",
+        "release_capture": os.environ.get("CAMBIUM_RELEASE_CAPTURE", "") == "1",
         "promote_recalls": int(os.environ.get("CAMBIUM_PROMOTE_RECALLS", "3")),
         "worktree": os.path.join(repo, ".git", "cambium-wt"),
         "local_store": os.path.join(repo, LOCAL_DIR, KNOWLEDGE_FILE),
@@ -191,7 +196,11 @@ def _now():
 # local store
 # --------------------------------------------------------------------------- #
 def _empty_local():
-    return {"items": [], "imported": {"context_keeper": [], "agentsync": []}}
+    # imported.agentsync        : sha1 watermarks — the single dedupe path
+    # imported.agentsync_last   : last-seen claim per agent, for release-time
+    #                             transition detection (see distill())
+    return {"items": [],
+            "imported": {"context_keeper": [], "agentsync": [], "agentsync_last": {}}}
 
 
 def _read_local(cfg):
@@ -207,6 +216,7 @@ def _read_local(cfg):
     data.setdefault("imported", {})
     data["imported"].setdefault("context_keeper", [])
     data["imported"].setdefault("agentsync", [])
+    data["imported"].setdefault("agentsync_last", {})
     return data
 
 
@@ -462,6 +472,68 @@ def _eligible_org(item):
 
 
 # --------------------------------------------------------------------------- #
+# agentsync distillation (shared by the full-distill pass and release-time
+# capture so a claim caught either way carries the identical dedupe key)
+# --------------------------------------------------------------------------- #
+def _agentsync_key(agent, task, branch, note):
+    """The idempotency watermark for one agentsync claim — unchanged from the
+    original inline computation so old watermarks stay valid."""
+    return hashlib.sha1(
+        f"{agent}|{task}|{branch}|{note}".encode()
+    ).hexdigest()[:12]
+
+
+def _agentsync_item(cfg, agent, claim):
+    """Build the outcome memory + its dedupe key for one agentsync claim."""
+    note = claim.get("note") or ""
+    task = claim.get("task") or "task"
+    branch = claim.get("branch", "") or ""
+    key = _agentsync_key(agent, task, branch, note)
+    files = [c.get("path") for c in (claim.get("changed_files") or [])
+             if isinstance(c, dict) and c.get("path")]
+    verb = "finished" if claim.get("status") == "done" else "released"
+    content = f"[{agent}] {verb} '{task}'"
+    if note:
+        content += f": {note}"
+    if files:
+        content += f" (files: {', '.join(files[:8])}" + \
+                   (", …)" if len(files) > 8 else ")")
+    item = _new_item(
+        cfg, content, "memory", "outcome",
+        note, ["agentsync", agent] + _parse_tags(task)[:4],
+        {"system": "agentsync", "ref": f"{agent}:{branch}"},
+    )
+    return item, key
+
+
+def _capture_claim(data, imported_as, new_items, item, key):
+    """Import an outcome once. Reuses the single agentsync watermark path, so
+    the same claim caught at release time and again in a later full distill
+    never double-imports."""
+    if key in imported_as:
+        return
+    imported_as.add(key)
+    data["items"].append(item)
+    data["imported"]["agentsync"].append(key)
+    new_items.append(item)
+
+
+def _claim_ident(claim):
+    """Logical identity of a claim, stable across in-progress -> done but
+    distinct across a re-claim (new task/branch under the same agent id)."""
+    if not isinstance(claim, dict):
+        return None
+    return (claim.get("task"), claim.get("branch"))
+
+
+def _claim_snapshot(claim):
+    """The slice of a claim we remember between sweeps to reconstruct its
+    outcome after it churns out of live state."""
+    return {k: claim.get(k) for k in
+            ("task", "branch", "status", "note", "changed_files")}
+
+
+# --------------------------------------------------------------------------- #
 # tools
 # --------------------------------------------------------------------------- #
 @mcp.tool()
@@ -510,7 +582,17 @@ def distill() -> str:
        provenance.
 
     Idempotent — each source record imports at most once; re-run freely (e.g.
-    from a session-end or post-commit hook for passive capture)."""
+    from a session-end or post-commit hook for passive capture).
+
+    Release-time capture (opt-in, CAMBIUM_RELEASE_CAPTURE=1): agentsync erases a
+    claim from live state the moment it is released or re-claimed, so a claim
+    that completes and churns before the next full distill is lost. With the flag
+    on, distill also remembers the last-seen claim per agent and captures any
+    that has churned away since the previous run — from that snapshot, via the
+    same watermark, so nothing double-imports. Wire distill to fire on
+    completion events and captured-once-at-completion is the result. The residual
+    gap: a done state that lives and dies entirely between two runs is never
+    observed (only the agentsync git log holds it)."""
     cfg = _cfg()
     data = _read_local(cfg)
     imported_as = set(data["imported"]["agentsync"])
@@ -521,36 +603,48 @@ def distill() -> str:
     repo, remote = cfg["repo"], cfg["remote"]
     as_branch = cfg["agentsync_branch"]
     agentsync_seen = False
+    released_captured = 0
     _git(["fetch", remote, as_branch], repo, check=False)
     claims_doc = _show_file(repo, f"{remote}/{as_branch}", "claims.json")
     if isinstance(claims_doc, dict):
         agentsync_seen = True
-        for agent, claim in claims_doc.get("claims", {}).items():
-            if claim.get("status") != "done":
+        claims_now = claims_doc.get("claims", {})
+        if not isinstance(claims_now, dict):
+            claims_now = {}
+
+        # (1) live done claims — the classic full-distill pass.
+        for agent, claim in claims_now.items():
+            if not isinstance(claim, dict) or claim.get("status") != "done":
                 continue
-            note = claim.get("note") or ""
-            task = claim.get("task") or "task"
-            key = hashlib.sha1(
-                f"{agent}|{task}|{claim.get('branch','')}|{note}".encode()
-            ).hexdigest()[:12]
-            if key in imported_as:
-                continue
-            files = [c.get("path") for c in (claim.get("changed_files") or [])
-                     if isinstance(c, dict) and c.get("path")]
-            content = f"[{agent}] finished '{task}'"
-            if note:
-                content += f": {note}"
-            if files:
-                content += f" (files: {', '.join(files[:8])}" + \
-                           (", …)" if len(files) > 8 else ")")
-            item = _new_item(
-                cfg, content, "memory", "outcome",
-                note, ["agentsync", agent] + [t for t in _parse_tags(task)][:4],
-                {"system": "agentsync", "ref": f"{agent}:{claim.get('branch','')}"},
-            )
-            data["items"].append(item)
-            data["imported"]["agentsync"].append(key)
-            new_items.append(item)
+            item, key = _agentsync_item(cfg, agent, claim)
+            _capture_claim(data, imported_as, new_items, item, key)
+
+        # (2) release-time capture (opt-in). agentsync exposes no hook or event:
+        # a claim marked done then released/re-claimed before a distill runs is
+        # silently erased from live state. So we diff the live claims against the
+        # last-seen snapshot and capture any claim that has churned away — from
+        # the snapshot, before the churn erases it — reusing the same watermark.
+        if cfg["release_capture"]:
+            last = data["imported"].setdefault("agentsync_last", {})
+            for agent, prev in list(last.items()):
+                if not isinstance(prev, dict):
+                    continue
+                if _claim_ident(claims_now.get(agent)) == _claim_ident(prev):
+                    continue  # same claim still live (may have progressed) — wait
+                # Only knowledge-bearing completions become memory: a done claim,
+                # or one carrying a reconciliation note. A never-noted abandoned
+                # claim holds nothing to distill.
+                if prev.get("status") != "done" and not (prev.get("note") or ""):
+                    continue
+                item, key = _agentsync_item(cfg, agent, prev)
+                before = len(new_items)
+                _capture_claim(data, imported_as, new_items, item, key)
+                released_captured += len(new_items) - before
+            # Advance the snapshot to the live claims for the next sweep.
+            data["imported"]["agentsync_last"] = {
+                a: _claim_snapshot(c) for a, c in claims_now.items()
+                if isinstance(c, dict)
+            }
 
     # --- source 2: context-keeper .context/ ------------------------------- #
     ck_seen = False
@@ -589,6 +683,8 @@ def distill() -> str:
         {
             "status": "distilled",
             "new_items": len(new_items),
+            "released_captured": released_captured,
+            "release_capture": cfg["release_capture"],
             "sources": {
                 "agentsync": "read" if agentsync_seen else "no coordination branch found",
                 "context_keeper": "read" if ck_seen else "no .context/ store found",
@@ -884,6 +980,7 @@ def status() -> str:
                 "org_repo": cfg["org_repo"] or None,
                 "org_mode": "pull-request" if cfg["org_pr"] else "direct-push",
             },
+            "release_capture": cfg["release_capture"],
             "promote_threshold_recalls": cfg["promote_recalls"],
         },
         indent=2,

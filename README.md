@@ -66,6 +66,7 @@ pip install -r requirements.txt      # just `mcp`
 | `CAMBIUM_ORG_REPO` | no | — | path to the org knowledge repo clone (org scope off without it) |
 | `CAMBIUM_ORG_PR` | no | direct push | `1` = org promotion opens a pull request |
 | `CAMBIUM_PROMOTE_RECALLS` | no | `3` | recalls needed for local→team |
+| `CAMBIUM_RELEASE_CAPTURE` | no | off | `1` = also capture agentsync claims at their done/released transition (see below) |
 
 **Org setup**: create one (private) repo, e.g. `github.com/you/knowledge`, with
 an empty `{"items": []}` in `knowledge.json`; everyone who should read org
@@ -81,10 +82,32 @@ scope (types: `memory` | `need` | `skill`). Manual path.
 promotable like anything else so recurring wants surface at team/org level.
 
 **`distill()`** — the automatic path. Reads agentsync's coordination branch
-(every *done* claim: task + note + changed files → an `outcome` memory) and
-context-keeper's `.context/` (active decisions & constraints, rationale and
-`dec-NNN` provenance preserved). Idempotent — wire it to a session-end or
-post-commit hook and capture becomes passive.
+(every *currently done* claim: task + note + changed files → an `outcome`
+memory) and context-keeper's `.context/` (active decisions & constraints,
+rationale and `dec-NNN` provenance preserved). Idempotent — wire it to a
+session-end or post-commit hook and capture becomes passive.
+
+**Release-time capture (opt-in, `CAMBIUM_RELEASE_CAPTURE=1`).** agentsync keys
+claims by agent id and deletes a claim from live state the instant it is
+released or re-claimed — it exposes no hook or event, only the rewritten
+`claims.json` on the branch. So a claim that completes and then churns before a
+full distill runs against it is silently lost. With the flag on, each distill
+also remembers the last-seen claim per agent and captures any that has *churned
+away* since the previous run — reconstructing it from that snapshot, through the
+**same** dedupe watermark, so a claim captured at release time and again in a
+later full distill never double-imports. Fire `distill()` on completion events
+(a post-commit / session-end hook) and completed work is captured at its
+transition instead of only when a distill happens to catch it live.
+
+What this is **not**: it is passive capture *at the moments distill runs*, not
+exhaustive reconstruction. The guarantee is precise — *if a distill sweep
+observes a claim while it is done (or carries a note), that knowledge is
+captured even if the claim later churns.* The residual gap: a done state that is
+created **and** churned away entirely between two sweeps (e.g. cambium wasn't
+running) is never observed, and only agentsync's git log still holds it.
+Walking that log to reconstruct such claims exhaustively is a possible
+follow-up (the history survives — agentsync's `history()` reads it), deliberately
+left out of this change.
 
 **`recall(query, scope, limit)`** — federated search across local+team+org.
 Every hit increments the item's recall counter (the trust signal promotion
@@ -120,7 +143,10 @@ ANY agent, ANY project, ANY type (SRE bot, KB bot): recall(scope="org")
 ```
 
 Passive capture: add a Claude Code hook that runs `distill` at session end —
-capture then costs zero per-note effort.
+capture then costs zero per-note effort. Run it on completion events too (a
+post-commit hook) with `CAMBIUM_RELEASE_CAPTURE=1` and finished agentsync work
+is captured at the moment it completes, before a release or re-claim can erase
+it.
 
 ## Test
 
@@ -128,14 +154,17 @@ capture then costs zero per-note effort.
 python3 test_cambium.py
 ```
 
-20 cases against real git repos: capture/recall (+ honest abstention),
+24 cases against real git repos: capture/recall (+ honest abstention),
 distill from both substrates (exact agentsync claims format; exact
-context-keeper `.context/` schema) with idempotency, the full promotion
-lifecycle (recall-threshold, endorsement fast-track, org-requires-endorsement,
-PR-mode with `gh` stubbed), cross-project trust tracking, team-write CAS under
-a concurrent peer push, a **real-agentsync integration test** (drives the
-actual agentsync tools when the sibling repo is present), and a **real MCP
-stdio transport test**. CI runs it on every push.
+context-keeper `.context/` schema) with idempotency, **release-time capture**
+(off by default; a done claim survives a re-claim churn captured exactly once;
+a noted claim released before it reaches *done* is kept where a full distill
+would miss it), the full promotion lifecycle (recall-threshold, endorsement
+fast-track, org-requires-endorsement, PR-mode with `gh` stubbed), cross-project
+trust tracking, team-write CAS under a concurrent peer push, **two
+real-agentsync integration tests** (drive the actual agentsync claim / finish /
+release tools when the sibling repo is present — including the release-capture
+seam), and a **real MCP stdio transport test**. CI runs it on every push.
 
 ## Limitations (honest ones)
 
@@ -146,8 +175,13 @@ stdio transport test**. CI runs it on every push.
   org items have already finished climbing.
 - **PR-mode promotion isn't transactional** — the team copy stays (annotated
   with the PR URL) until a human merges. That's the point: review is the gate.
-- **Distill imports agentsync's *current* done claims** — a claim released or
-  re-claimed before a distill run is not reconstructed from history.
+- **Distill captures at the moments it runs, not exhaustively.** By default it
+  imports agentsync's *currently* done claims; a claim released or re-claimed
+  before any distill catches it live is lost. `CAMBIUM_RELEASE_CAPTURE=1` closes
+  most of that gap by capturing claims at their done/released transition (via a
+  last-seen snapshot), but a done state created and churned away entirely
+  between two sweeps is still only recoverable from agentsync's git log — a
+  history walk that is not built here.
 
 ## License
 
