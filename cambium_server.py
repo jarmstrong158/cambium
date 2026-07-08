@@ -475,6 +475,82 @@ def _eligible_org(item):
 
 
 # --------------------------------------------------------------------------- #
+# post-promotion staleness — verification events + premise linkage.
+#
+# Trust-gated promotion defends knowledge on the way IN; nothing marked a
+# promoted entry going stale AFTERWARD. These helpers add that, deliberately
+# event-driven: last_verified is a timestamp set by an explicit verification
+# (promotion counts as one), never a decaying confidence score, and valid_while
+# is the free-text premise an entry depends on. Absent/old last_verified is a
+# signal to a human, not an automatic downgrade — no clock-driven decay.
+# --------------------------------------------------------------------------- #
+def _stamp_verified(item, when, note=""):
+    """Record a verification event on an entry (in place)."""
+    item["last_verified"] = when
+    if note:
+        item["last_verified_note"] = note
+    item["updated_at"] = when
+
+
+def _verified_key(item):
+    """Oldest-verified-first sort key: never-verified sorts before everything
+    (maximally stale), then ascending ISO timestamp (lexical == chronological)."""
+    lv = item.get("last_verified")
+    return (lv is not None, lv or "")
+
+
+def _days_since(ts):
+    """Whole days since an ISO timestamp, or None if absent/unparseable."""
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt).days
+
+
+def _stale_entry_view(scope, item):
+    lv = item.get("last_verified")
+    return {
+        "id": item.get("id"),
+        "scope": scope,
+        "project": item.get("project"),
+        "kind": item.get("kind"),
+        "content": (item.get("content") or "")[:120],
+        "last_verified": lv,
+        "never_verified": lv is None,
+        "days_since_verified": _days_since(lv),
+        "valid_while": item.get("valid_while", ""),
+    }
+
+
+def _verification_prompt(cfg, basis_items, limit=3):
+    """The oldest-verified promoted (team/org) entries relevant to what just
+    completed — surfaced at the release moment so re-verification piggybacks on an
+    existing workflow beat instead of needing a new habit. Best-effort; never
+    fails the distill."""
+    q = set()
+    for it in basis_items:
+        q |= _tokens(it.get("content", ""))
+        q |= {t.lower() for t in it.get("tags", [])}
+    if not q:
+        return []
+    try:
+        promoted = [("team", i) for i in _read_team(cfg)]
+        if cfg["org_repo"]:
+            promoted += [("org", i) for i in _read_org(cfg)]
+    except Exception:
+        return []  # a nudge is best-effort — never break capture over it
+    relevant = [(s, i) for s, i in promoted
+                if i.get("status") == "active" and _score(i, q) > 0]
+    relevant.sort(key=lambda si: _verified_key(si[1]))
+    return [_stale_entry_view(s, i) for s, i in relevant[:limit]]
+
+
+# --------------------------------------------------------------------------- #
 # agentsync distillation (shared by the full-distill pass and release-time
 # capture so a claim caught either way carries the identical dedupe key)
 # --------------------------------------------------------------------------- #
@@ -667,15 +743,17 @@ IMPORT_ADAPTERS = {
 # --------------------------------------------------------------------------- #
 @mcp.tool()
 def capture(content: str, type: str = "memory", kind: str = "note",
-            why: str = "", tags: str = "") -> str:
+            why: str = "", tags: str = "", valid_while: str = "") -> str:
     """Save a knowledge item to your LOCAL scope: a fact, design note, gotcha,
     or troubleshooting step worth remembering. This is the manual capture path;
     distill() is the automatic one.
 
-    type : memory | need | skill
-    kind : freeform subtype (note, decision, constraint, runbook, ...)
-    why  : the rationale — makes the item far more useful at recall time
-    tags : comma/space-separated keywords (boost recall matching)"""
+    type        : memory | need | skill
+    kind        : freeform subtype (note, decision, constraint, runbook, ...)
+    why         : the rationale — makes the item far more useful at recall time
+    tags        : comma/space-separated keywords (boost recall matching)
+    valid_while : optional premise this knowledge depends on, e.g. "while we're
+                  on NetSuite" — surfaced later so a dead assumption is spottable"""
     if type not in VALID_TYPES:
         return json.dumps({"error": f"type must be one of {', '.join(VALID_TYPES)}"})
     if not content.strip():
@@ -684,6 +762,8 @@ def capture(content: str, type: str = "memory", kind: str = "note",
     data = _read_local(cfg)
     item = _new_item(cfg, content.strip(), type, kind, why.strip(),
                      _parse_tags(tags), {"system": "manual", "ref": ""})
+    if valid_while.strip():
+        item["valid_while"] = valid_while.strip()
     data["items"].append(item)
     _write_local(cfg, data)
     return json.dumps({"status": "captured", "item": item}, indent=2)
@@ -733,6 +813,7 @@ def distill() -> str:
     as_branch = cfg["agentsync_branch"]
     agentsync_seen = False
     released_captured = 0
+    verification_prompt = []
     _git(["fetch", remote, as_branch], repo, check=False)
     claims_doc = _show_file(repo, f"{remote}/{as_branch}", "claims.json")
     if isinstance(claims_doc, dict):
@@ -775,6 +856,13 @@ def distill() -> str:
                 if isinstance(c, dict)
             }
 
+    # Lifecycle hook: at the release moment, nudge re-verification of the
+    # oldest-verified promoted entries relevant to what just completed. new_items
+    # so far are the agentsync outcomes (context-keeper runs below), so they are
+    # exactly the "what just happened" basis. Only in the release-capture path.
+    if cfg["release_capture"]:
+        verification_prompt = _verification_prompt(cfg, list(new_items))
+
     # --- source 2: context-keeper .context/ ------------------------------- #
     ck_seen = False
     for fname, kind, text_f, why_f in (
@@ -814,6 +902,7 @@ def distill() -> str:
             "new_items": len(new_items),
             "released_captured": released_captured,
             "release_capture": cfg["release_capture"],
+            "verification_prompt": verification_prompt,
             "sources": {
                 "agentsync": "read" if agentsync_seen else "no coordination branch found",
                 "context_keeper": "read" if ck_seen else "no .context/ store found",
@@ -1006,6 +1095,42 @@ def endorse(item_id: str, note: str = "") -> str:
 
 
 @mcp.tool()
+def verify_entry(item_id: str, note: str = "") -> str:
+    """Confirm a knowledge entry still holds — stamp its last_verified to now.
+    This is the event that keeps promoted knowledge honest: promotion's trust gate
+    defends what comes IN, verification keeps an entry from silently going stale
+    after. An optional note records what was confirmed. Absent/old last_verified
+    is a signal (see stale_report), never an automatic downgrade. Works on local
+    and team entries; find stale ones with stale_report()."""
+    cfg = _cfg()
+    when = _now()
+
+    data = _read_local(cfg)
+    for i in data["items"]:
+        if i["id"] == item_id:
+            _stamp_verified(i, when, note)
+            _write_local(cfg, data)
+            return json.dumps({"status": "verified", "scope": "local",
+                               "last_verified": when, "item": i}, indent=2)
+
+    found = {}
+    def mark(team_data):
+        for i in team_data["items"]:
+            if i["id"] == item_id:
+                _stamp_verified(i, when, note)
+                found["item"] = i
+                return None
+        return False
+    ok = _team_mutate(cfg, mark, f"cambium: {cfg['agent']} verifies {item_id}")
+    if found.get("item"):
+        return json.dumps({"status": "verified", "scope": "team",
+                           "last_verified": when, "item": found["item"]}, indent=2)
+    if not ok:
+        return json.dumps({"status": "retry_exhausted"})
+    return json.dumps({"error": f"No item '{item_id}' in local or team scope."})
+
+
+@mcp.tool()
 def promote(item_id: str = "", to_scope: str = "", force: bool = False) -> str:
     """Graduate knowledge up a scope as it earns trust — the compound-growth
     step. With no arguments, scans your local items and promotes every one
@@ -1034,8 +1159,10 @@ def promote(item_id: str = "", to_scope: str = "", force: bool = False) -> str:
                            "(endorse() it, or force=True).",
             })
         item = dict(src)
+        stamped = _now()
         item["scope"] = "org"
-        item["updated_at"] = _now()
+        item["updated_at"] = stamped
+        item["last_verified"] = stamped  # promotion IS a verification
         if cfg["org_pr"]:
             ok, url = _org_add_pr(cfg, item)
             if not ok:
@@ -1085,9 +1212,11 @@ def promote(item_id: str = "", to_scope: str = "", force: bool = False) -> str:
                                "threshold yet. See review_promotions()."})
 
     moved = []
+    stamped = _now()
     for c in candidates:
         c["scope"] = "team"
-        c["updated_at"] = _now()
+        c["updated_at"] = stamped
+        c["last_verified"] = stamped  # promotion IS a verification
     ids = {c["id"] for c in candidates}
 
     def add(team_data):
@@ -1135,6 +1264,54 @@ def review_promotions() -> str:
             "org_prs_pending": [{"id": i["id"], "pr": i["promotion"]["pr"]}
                                 for i in team if i.get("promotion")],
             "org_configured": bool(cfg["org_repo"]),
+        },
+        indent=2,
+    )
+
+
+@mcp.tool()
+def stale_report(project: str = "", older_than_days: int = 0) -> str:
+    """Which promoted knowledge might be going stale? Lists team + org entries
+    (the ones that cleared the trust gate) sorted OLDEST-VERIFIED-FIRST, with
+    never-reverified entries flagged at the top and each entry's valid_while
+    premise surfaced so a reader can spot dead assumptions ("while we're on
+    NetSuite" long after the NetSuite migration).
+
+    project         : limit to one project's entries (default: all)
+    older_than_days : only entries last verified more than N days ago (plus every
+                      never-verified one); 0 = no age filter.
+
+    Event-driven, not clock-driven: this reports absent/old verification events,
+    it does NOT compute a decaying confidence score. Re-confirm with
+    verify_entry(); promotion also counts as a verification."""
+    cfg = _cfg()
+    older_than_days = max(0, int(older_than_days))
+    pool = [("team", i) for i in _read_team(cfg)]
+    if cfg["org_repo"]:
+        pool += [("org", i) for i in _read_org(cfg)]
+
+    rows = []
+    for scope, i in pool:
+        if i.get("status") != "active":
+            continue
+        if project and i.get("project") != project:
+            continue
+        if older_than_days:
+            age = _days_since(i.get("last_verified"))
+            # never-verified (age is None) is maximally stale — always kept
+            if age is not None and age < older_than_days:
+                continue
+        rows.append((scope, i))
+    rows.sort(key=lambda si: _verified_key(si[1]))
+    views = [_stale_entry_view(s, i) for s, i in rows]
+    return json.dumps(
+        {
+            "scope": "team+org" if cfg["org_repo"] else "team",
+            "project": project or "all",
+            "older_than_days": older_than_days,
+            "count": len(views),
+            "never_verified": sum(1 for v in views if v["never_verified"]),
+            "entries": views,
         },
         indent=2,
     )

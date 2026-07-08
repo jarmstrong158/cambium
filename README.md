@@ -126,7 +126,15 @@ floor it returns `no_confident_match: true` instead of confident-looking noise.
 **`promote(item_id, to_scope, force)`** — no args: scan-and-promote all
 eligible local items to team. With `to_scope="org"`: push to the org repo, or
 open a PR when `CAMBIUM_ORG_PR=1` (the team copy stays, annotated, until the
-PR merges).
+PR merges). Promotion stamps `last_verified` — promotion *is* a verification.
+
+**`verify_entry(item_id, note)`** — confirm an entry still holds; stamps its
+`last_verified` to now (optional note). The event that keeps promoted knowledge
+from silently going stale (see *Machine-maintained documentation entropy*).
+
+**`stale_report(project, older_than_days)`** — promoted (team + org) entries
+sorted oldest-verified-first, never-reverified ones flagged, each entry's
+`valid_while` premise surfaced. Reports staleness; never auto-downgrades.
 
 **`review_promotions()`** — what's eligible for team, what's endorsed for org,
 which org PRs are pending.
@@ -211,15 +219,44 @@ system, add one adapter (a generator yielding normalized items) to
 `IMPORT_ADAPTERS`; core logic doesn't change. Adapters that require network
 access or credentials are intentionally not included here.
 
+## Machine-maintained documentation entropy
+
+Trust-gated promotion defends knowledge on the way *in*: an entry only reaches
+team or org after it earns recalls or an endorsement. But nothing marked it
+going stale *afterward*. A fact that was true when it cleared the gate — "billing
+runs on NetSuite", "the staging DB caps at 90 connections" — stays trusted long
+after the premise dies. Worse, agents *recall* it, act on it, and cite it, so a
+wrong assumption doesn't just persist; it gets institutionalized, and the more
+it's used the more authoritative it looks. Promotion raises the stakes of being
+wrong without adding any way to notice you've become wrong.
+
+cambium closes this with **verification events and premise linkage**, not
+confidence scores or time decay — both of which manufacture false precision. A
+`0.62`-confidence memory implies a measurement nobody took, and "trust halves
+every 90 days" would quietly demote knowledge that is simply stable and correct.
+Instead every entry carries an optional `last_verified` timestamp (promotion
+counts as the first verification; `verify_entry` records later ones) and an
+optional `valid_while` premise naming the condition it depends on. Staleness is
+**event-driven**: `stale_report` sorts promoted entries oldest-verified-first
+and flags the never-reverified, and `distill`'s release-time path surfaces the
+oldest-verified relevant entries right when work completes — so re-checking rides
+an existing workflow beat. Absent or old `last_verified` is a *signal to a human*,
+never an automatic downgrade. cambium reports the smell; a person decides.
+
 ## Test
 
 ```bash
 python3 test_cambium.py
 ```
 
-31 cases against real git repos: capture/recall (+ honest abstention),
+39 cases against real git repos: capture/recall (+ honest abstention),
 distill from both substrates (exact agentsync claims format; exact
-context-keeper `.context/` schema) with idempotency, **release-time capture**
+context-keeper `.context/` schema) with idempotency, **post-promotion
+staleness** (optional `last_verified`/`valid_while` fields, absent-field
+back-compat, `verify_entry` local + team round-trips, promotion stamps
+verification, `stale_report` oldest-first ordering + never-verified flag + age
+and project filters, release distill surfaces the verification prompt),
+**release-time capture**
 (off by default; a done claim survives a re-claim churn captured exactly once;
 a noted claim released before it reaches *done* is kept where a full distill
 would miss it), **import** (JSON + JSONL export → provenance-tagged local items,
