@@ -1,5 +1,7 @@
 # cambium
 
+_Part of the [xylem](https://github.com/jarmstrong158/xylem) stack._
+
 The knowledge-lifecycle MCP that turns work your agents already did into
 **compound, org-wide knowledge**. cambium bridges two substrates that already
 exist — [agentsync](https://github.com/jarmstrong158/agentsync) (what happened:
@@ -251,3 +253,7 @@ seam), and a **real MCP stdio transport test**. CI runs it on every push.
 
 [PolyForm Noncommercial License 1.0.0](LICENSE.md) — free for any
 noncommercial use.
+
+## Related
+
+Part of the [xylem](https://github.com/jarmstrong158/xylem) stack.
