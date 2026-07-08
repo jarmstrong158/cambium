@@ -505,6 +505,155 @@ def test_import_items_are_not_auto_promoted():
 
 
 # --------------------------------------------------------------------------- #
+# post-promotion staleness — verification events + premise linkage
+# --------------------------------------------------------------------------- #
+def mk_item(item_id, content, scope="team", last_verified=None, valid_while=None,
+            project="proj", tags=None, status="active"):
+    """A minimal promoted-shaped item for seeding the team store directly."""
+    it = {"id": item_id, "type": "memory", "kind": "note", "content": content,
+          "why": "", "tags": tags or [], "scope": scope, "project": project,
+          "source": {"system": "manual", "ref": ""}, "created_by": "t",
+          "created_at": "2025-01-01T00:00:00+00:00",
+          "updated_at": "2025-01-01T00:00:00+00:00", "status": status,
+          "trust": {"recalls": 0, "endorsements": [], "projects": [project]}}
+    if last_verified is not None:
+        it["last_verified"] = last_verified
+    if valid_while is not None:
+        it["valid_while"] = valid_while
+    return it
+
+
+def seed_team_items(items):
+    """Push crafted items onto the team branch via the real CAS write path."""
+    def add(data):
+        data["items"].extend(items)
+        return None
+    assert M._team_mutate(M._cfg(), add, "test: seed team items")
+
+
+def test_optional_staleness_fields_absent_are_handled():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        # a legacy-shaped item carries neither new field
+        item = json.loads(M.capture("legacy fact", tags="legacy"))["item"]
+        assert "last_verified" not in item and "valid_while" not in item, item
+        # recall still works, and verify_entry adds the field cleanly
+        assert json.loads(M.recall("legacy fact"))["results"], "recall broke"
+        v = json.loads(M.verify_entry(item["id"]))
+        assert v["status"] == "verified" and v["item"]["last_verified"], v
+
+
+def test_capture_records_valid_while_premise():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        r = json.loads(M.capture("Sync inventory nightly via the REST bridge",
+                                 valid_while="while we're on NetSuite",
+                                 tags="inventory"))
+        assert r["item"]["valid_while"] == "while we're on NetSuite", r
+        stored = M._read_local(M._cfg())["items"][0]
+        assert stored["valid_while"] == "while we're on NetSuite", stored
+
+
+def test_verify_entry_local_roundtrip():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        iid = json.loads(M.capture("cron runs at 0300 UTC", tags="cron"))["item"]["id"]
+        assert "last_verified" not in M._read_local(M._cfg())["items"][0]
+        v = json.loads(M.verify_entry(iid, note="confirmed with ops"))
+        assert v["status"] == "verified" and v["scope"] == "local", v
+        stored = M._read_local(M._cfg())["items"][0]
+        assert stored["last_verified"] == v["last_verified"], stored
+        assert stored["last_verified_note"] == "confirmed with ops", stored
+
+
+def test_promotion_stamps_last_verified():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny", CAMBIUM_PROMOTE_RECALLS="1")
+        iid = json.loads(M.capture("promote me", tags="promo"))["item"]["id"]
+        assert "last_verified" not in M._read_local(M._cfg())["items"][0]
+        M.recall("promote me")  # 1 recall -> eligible
+        assert json.loads(M.promote())["status"] == "promoted"
+        team_item = next(i for i in M._read_team(M._cfg()) if i["id"] == iid)
+        assert team_item["last_verified"], "promotion must stamp last_verified"
+
+
+def test_verify_entry_reaches_team_scope():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        iid = json.loads(M.capture("shared team truth", tags="shared"))["item"]["id"]
+        M.endorse(iid)
+        M.promote()  # -> team, stamped at promotion
+        promo_ts = next(i for i in M._read_team(M._cfg())
+                        if i["id"] == iid)["last_verified"]
+        v = json.loads(M.verify_entry(iid, note="re-checked"))
+        assert v["status"] == "verified" and v["scope"] == "team", v
+        after = next(i for i in M._read_team(M._cfg()) if i["id"] == iid)
+        assert after["last_verified"] == v["last_verified"] >= promo_ts, after
+        assert after["last_verified_note"] == "re-checked", after
+
+
+def test_stale_report_orders_oldest_first_and_flags_never_verified():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        seed_team_items([
+            mk_item("k-recent", "recently verified",
+                    last_verified="2026-07-01T00:00:00+00:00"),
+            mk_item("k-old", "verified long ago",
+                    last_verified="2025-01-01T00:00:00+00:00"),
+            mk_item("k-never", "never reverified since a legacy promotion",
+                    valid_while="while we're on NetSuite"),
+        ])
+        rep = json.loads(M.stale_report())
+        assert [e["id"] for e in rep["entries"]] == ["k-never", "k-old",
+                                                     "k-recent"], rep
+        assert rep["never_verified"] == 1, rep
+        never = rep["entries"][0]
+        assert never["never_verified"] is True and never["last_verified"] is None
+        assert never["valid_while"] == "while we're on NetSuite", never
+
+
+def test_stale_report_older_than_days_and_project_filters():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        seed_team_items([
+            mk_item("k-fresh", "verified just now", project="alpha",
+                    last_verified=M._now()),
+            mk_item("k-stale", "verified ages ago", project="alpha",
+                    last_verified="2025-01-01T00:00:00+00:00"),
+            mk_item("k-never", "never verified", project="alpha"),
+            mk_item("k-beta", "other project", project="beta"),
+        ])
+        rep = json.loads(M.stale_report(project="alpha", older_than_days=30))
+        ids = {e["id"] for e in rep["entries"]}
+        assert "k-fresh" not in ids, rep       # recently verified -> filtered
+        assert "k-beta" not in ids, rep        # wrong project -> filtered
+        assert ids == {"k-stale", "k-never"}, rep  # old + never kept
+
+
+def test_distill_release_includes_verification_prompt():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny", CAMBIUM_RELEASE_CAPTURE="1")
+        # a promoted, never-reverified entry relevant to the auth work about to
+        # land, plus an unrelated one that should NOT surface
+        seed_team_items([
+            mk_item("k-authold", "auth service hashes passwords with argon2id",
+                    tags=["auth", "argon2id"], valid_while="while argon2 is our KDF"),
+            mk_item("k-billing", "invoices are net-30", tags=["billing"],
+                    last_verified="2026-07-01T00:00:00+00:00"),
+        ])
+        seed_agentsync_branch(clones["stobie"], {"stobie": DONE_CLAIM})
+        d = json.loads(M.distill())
+        vp = d["verification_prompt"]
+        assert vp, "release distill should surface a verification prompt"
+        ids = [e["id"] for e in vp]
+        assert "k-authold" in ids, vp          # relevant to the auth release
+        assert "k-billing" not in ids, vp      # unrelated -> not surfaced
+        top = next(e for e in vp if e["id"] == "k-authold")
+        assert top["never_verified"] is True, top
+        assert top["valid_while"] == "while argon2 is our KDF", top
+
+
+# --------------------------------------------------------------------------- #
 # promotion lifecycle
 # --------------------------------------------------------------------------- #
 def test_promote_local_to_team_by_recalls():
@@ -878,6 +1027,14 @@ TESTS = [
     test_import_rejects_unknown_source_and_missing_file,
     test_import_is_read_only_against_source,
     test_import_items_are_not_auto_promoted,
+    test_optional_staleness_fields_absent_are_handled,
+    test_capture_records_valid_while_premise,
+    test_verify_entry_local_roundtrip,
+    test_promotion_stamps_last_verified,
+    test_verify_entry_reaches_team_scope,
+    test_stale_report_orders_oldest_first_and_flags_never_verified,
+    test_stale_report_older_than_days_and_project_filters,
+    test_distill_release_includes_verification_prompt,
     test_promote_local_to_team_by_recalls,
     test_endorse_fast_tracks_promotion,
     test_promote_explicit_id_respects_threshold_and_force,
