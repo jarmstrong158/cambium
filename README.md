@@ -43,20 +43,51 @@ pip install -r requirements.txt      # just `mcp`
 
 ## Configure
 
+Point an MCP client at the server — no env required to start:
+
 ```json
 {
   "mcpServers": {
     "cambium": {
       "command": "python3",
-      "args": ["/abs/path/to/cambium_server.py"],
-      "env": {
-        "CAMBIUM_REPO": "/abs/path/to/your/project/clone",
-        "CAMBIUM_AGENT_ID": "jonny"
-      }
+      "args": ["/abs/path/to/cambium_server.py"]
     }
   }
 }
 ```
+
+**First contact is helpful, not cold.** MCP servers can't start a conversation,
+so cambium teaches you through its own responses. Call **`status()`** (or any
+tool) before it's configured and instead of a bare env error you get structured
+guidance — what's set, what's missing, what each gap costs in plain terms, and
+the exact `setup()` call that fixes it:
+
+```jsonc
+{
+  "configured": false,
+  "gaps": [
+    {"setting": "CAMBIUM_REPO",
+     "cost": "no project repo → cambium has no substrate; every tool is unavailable",
+     "fix": "setup(project_repo=\"/abs/path/to/your/clone\", agent_id=\"your-id\")"},
+    {"setting": "CAMBIUM_ORG_REPO",
+     "cost": "org scope off → promotions stop at team; org-wide recall unavailable",
+     "fix": "setup(project_repo=…, agent_id=…, org_repo=\"owner/knowledge or /abs/path/to/clone\")"}
+  ],
+  "next_step": "setup(project_repo=\"/abs/path/to/your/clone\", agent_id=\"your-id\")"
+}
+```
+
+**`setup(project_repo, agent_id, org_repo?, org_pr?, team_branch?)`** finishes
+the job: it validates the paths, scaffolds `.cambium/` (and adds it to the
+repo's `.gitignore`), and writes a fallback config at `~/.cambium/config.json`
+that the server reads when env vars are absent. It takes effect immediately — no
+restart. **No secrets are written**: the file holds only paths, ids, and flags,
+and lives outside any repo. If `org_repo` is a GitHub `owner/name` you haven't
+cloned locally, setup **offers the exact `gh`/`git` commands** to stand it up
+and leaves org scope off — it never creates or pushes a repo for you.
+
+**Env still wins.** Any of the variables below, set in the MCP client config,
+overrides the config file per-key — the table is the full reference layer:
 
 | env var | required | default | meaning |
 |---|---|---|---|
@@ -69,11 +100,13 @@ pip install -r requirements.txt      # just `mcp`
 | `CAMBIUM_ORG_PR` | no | direct push | `1` = org promotion opens a pull request |
 | `CAMBIUM_PROMOTE_RECALLS` | no | `3` | recalls needed for local→team |
 | `CAMBIUM_RELEASE_CAPTURE` | no | off | `1` = also capture agentsync claims at their done/released transition (see below) |
+| `CAMBIUM_CONFIG_FILE` | no | `~/.cambium/config.json` | override the fallback config path (mainly for tests) |
 
 **Org setup**: create one (private) repo, e.g. `github.com/you/knowledge`, with
 an empty `{"items": []}` in `knowledge.json`; everyone who should read org
-knowledge clones it and points `CAMBIUM_ORG_REPO` at their clone. cambium
-manages that clone (it hard-syncs it) — dedicate it, don't work in it.
+knowledge clones it and points `CAMBIUM_ORG_REPO` (or `setup(org_repo=…)`) at
+their clone. cambium manages that clone (it hard-syncs it) — dedicate it, don't
+work in it.
 
 ## Tools
 
@@ -139,8 +172,14 @@ sorted oldest-verified-first, never-reverified ones flagged, each entry's
 **`review_promotions()`** — what's eligible for team, what's endorsed for org,
 which org PRs are pending.
 
-**`status()`** — counts per scope/type, import watermarks, which substrates
-are actually wired.
+**`setup(project_repo, agent_id, org_repo?, org_pr?, team_branch?)`** — finish
+configuration from a cold start (see *Configure*). Validates paths, scaffolds
+`.cambium/`, writes the fallback config; offers `gh` commands for an org repo
+rather than creating one. No secrets written.
+
+**`status()`** — config state first: what's set, what's missing, each gap's cost
+and the `setup()` that fixes it (never raises when unconfigured). Once
+configured, also counts per scope/type, import watermarks, and wired substrates.
 
 ## The compound-growth loop
 
@@ -249,7 +288,11 @@ never an automatic downgrade. cambium reports the smell; a person decides.
 python3 test_cambium.py
 ```
 
-39 cases against real git repos: capture/recall (+ honest abstention),
+46 cases against real git repos: **onboarding** (unconfigured `status()` reports
+gaps with costs and fixes, every tool fails helpful when unconfigured, `setup()`
+configures from a cold start and its config takes effect in-process, env
+overrides the file, org names are offered as `gh` commands not created, non-git
+and missing paths rejected), capture/recall (+ honest abstention),
 distill from both substrates (exact agentsync claims format; exact
 context-keeper `.context/` schema) with idempotency, **post-promotion
 staleness** (optional `last_verified`/`valid_while` fields, absent-field
