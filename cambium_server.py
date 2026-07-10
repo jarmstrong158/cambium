@@ -86,37 +86,175 @@ def _noninteractive_env():
 
 # --------------------------------------------------------------------------- #
 # config
+#
+# MCP servers can't initiate a conversation, so cambium can't pop a setup
+# wizard. Instead the server teaches whoever touches it how to finish setup:
+# every tool that hits missing config returns structured guidance (what's set,
+# what's missing, what each gap costs, and the exact setup() call that fixes it)
+# rather than a bare env error. Config resolves per-key from the environment
+# first, then a local fallback file setup() writes — env always wins.
 # --------------------------------------------------------------------------- #
 class ConfigError(RuntimeError):
     pass
 
 
+# The settings cambium understands, with the plain-terms cost of leaving each
+# unset. Ordered required-first. gap-fixing always routes back through setup().
+_CONFIG_KEYS = ("CAMBIUM_REPO", "CAMBIUM_AGENT_ID", "CAMBIUM_ORG_REPO",
+                "CAMBIUM_TEAM_BRANCH", "CAMBIUM_ORG_PR", "CAMBIUM_RELEASE_CAPTURE",
+                "CAMBIUM_PROMOTE_RECALLS", "CAMBIUM_REMOTE",
+                "CAMBIUM_AGENTSYNC_BRANCH")
+
+
+def _config_file():
+    """Path to the local fallback config. Lives in the user's home (outside any
+    repo, so it is never committed); CAMBIUM_CONFIG_FILE overrides it."""
+    override = os.environ.get("CAMBIUM_CONFIG_FILE")
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    return os.path.join(os.path.expanduser("~"), ".cambium", "config.json")
+
+
+def _load_config_file():
+    """The fallback config as a dict, or {} if absent/unreadable. Never raises."""
+    try:
+        with open(_config_file(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_config_file(conf):
+    path = _config_file()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(conf, f, indent=2)
+
+
+def _resolve(name, file_cfg, default=None):
+    """Env wins, then the fallback file, then the default. Empty string counts
+    as unset, matching the original get(..., '') behaviour."""
+    v = os.environ.get(name)
+    if v is not None and v != "":
+        return v
+    fv = file_cfg.get(name)
+    if fv is not None and fv != "":
+        return fv if isinstance(fv, str) else str(fv)
+    return default
+
+
+def _config_source(name, file_cfg):
+    if os.environ.get(name):
+        return "env"
+    if file_cfg.get(name) not in (None, ""):
+        return "config-file"
+    return "unset"
+
+
+def _abspath(p):
+    return os.path.abspath(os.path.expanduser(p)) if p else ""
+
+
 def _cfg():
-    repo = os.environ.get("CAMBIUM_REPO")
-    agent = os.environ.get("CAMBIUM_AGENT_ID")
+    """Resolved config dict, or ConfigError if a required setting is missing or
+    the repo isn't a git clone. Tools call this via _require_cfg() so the error
+    becomes helpful guidance instead of a raised exception."""
+    file_cfg = _load_config_file()
+    repo = _resolve("CAMBIUM_REPO", file_cfg)
+    agent = _resolve("CAMBIUM_AGENT_ID", file_cfg)
     if not repo or not agent:
-        raise ConfigError(
-            "CAMBIUM_REPO and CAMBIUM_AGENT_ID must be set in the MCP config."
-        )
-    repo = os.path.abspath(repo)
+        missing = [n for n, v in (("CAMBIUM_REPO", repo),
+                                  ("CAMBIUM_AGENT_ID", agent)) if not v]
+        raise ConfigError("cambium is not configured: missing "
+                          + ", ".join(missing))
+    repo = _abspath(repo)
     if not os.path.isdir(os.path.join(repo, ".git")):
         raise ConfigError(f"{repo} is not a git repository (no .git directory).")
-    org = os.environ.get("CAMBIUM_ORG_REPO", "")
+    org = _resolve("CAMBIUM_ORG_REPO", file_cfg, "")
     return {
         "repo": repo,
         "agent": agent,
         "project": os.path.basename(repo.rstrip("/\\")),
-        "remote": os.environ.get("CAMBIUM_REMOTE", "origin"),
-        "team_branch": os.environ.get("CAMBIUM_TEAM_BRANCH", "cambium"),
-        "agentsync_branch": os.environ.get("CAMBIUM_AGENTSYNC_BRANCH", "agentsync"),
-        "org_repo": os.path.abspath(org) if org else "",
-        "org_pr": os.environ.get("CAMBIUM_ORG_PR", "") == "1",
-        "release_capture": os.environ.get("CAMBIUM_RELEASE_CAPTURE", "") == "1",
-        "promote_recalls": int(os.environ.get("CAMBIUM_PROMOTE_RECALLS", "3")),
+        "remote": _resolve("CAMBIUM_REMOTE", file_cfg, "origin"),
+        "team_branch": _resolve("CAMBIUM_TEAM_BRANCH", file_cfg, "cambium"),
+        "agentsync_branch": _resolve("CAMBIUM_AGENTSYNC_BRANCH", file_cfg,
+                                     "agentsync"),
+        "org_repo": _abspath(org),
+        "org_pr": _resolve("CAMBIUM_ORG_PR", file_cfg, "") == "1",
+        "release_capture": _resolve("CAMBIUM_RELEASE_CAPTURE", file_cfg, "") == "1",
+        "promote_recalls": int(_resolve("CAMBIUM_PROMOTE_RECALLS", file_cfg, "3")
+                               or "3"),
         "worktree": os.path.join(repo, ".git", "cambium-wt"),
         "local_store": os.path.join(repo, LOCAL_DIR, KNOWLEDGE_FILE),
         "context_dir": os.path.join(repo, ".context"),
     }
+
+
+def _config_state():
+    """Structured config state that NEVER raises: what's set, what's missing,
+    what each gap costs in plain terms, and the exact setup() call that fixes it.
+    Powers status() and the fail-helpful path so any agent that touches an
+    unconfigured cambium can offer setup conversationally from the response."""
+    file_cfg = _load_config_file()
+    repo = _resolve("CAMBIUM_REPO", file_cfg)
+    agent = _resolve("CAMBIUM_AGENT_ID", file_cfg)
+    org = _resolve("CAMBIUM_ORG_REPO", file_cfg, "")
+    repo_is_git = bool(repo) and os.path.isdir(os.path.join(_abspath(repo), ".git"))
+
+    setup_hint = ('setup(project_repo="/abs/path/to/your/clone", '
+                  'agent_id="your-id")')
+    gaps = []
+    if not repo:
+        gaps.append({"setting": "CAMBIUM_REPO",
+                     "cost": "no project repo → cambium has no substrate to read "
+                             "or write; every tool is unavailable",
+                     "fix": setup_hint})
+    elif not repo_is_git:
+        gaps.append({"setting": "CAMBIUM_REPO",
+                     "cost": f"{_abspath(repo)} is not a git repository → cambium "
+                             "stores knowledge in git and needs a real clone",
+                     "fix": 'setup(project_repo="/abs/path/to/a/git/clone", '
+                            'agent_id="your-id")'})
+    if not agent:
+        gaps.append({"setting": "CAMBIUM_AGENT_ID",
+                     "cost": "no agent identity → captures, endorsements and "
+                             "promotions can't be attributed to anyone",
+                     "fix": setup_hint})
+    if not org:
+        gaps.append({"setting": "CAMBIUM_ORG_REPO",
+                     "cost": "org scope off → promotions stop at team; org-wide "
+                             "recall is unavailable",
+                     "fix": 'setup(project_repo="…", agent_id="…", '
+                            'org_repo="owner/knowledge or /abs/path/to/clone")'})
+
+    configured = bool(repo and agent and repo_is_git)
+    state = {
+        "configured": configured,
+        "me": agent or None,
+        "project": os.path.basename(_abspath(repo).rstrip("/\\")) if repo else None,
+        "config_source": {n: _config_source(n, file_cfg) for n in _CONFIG_KEYS},
+        "config_file": _config_file(),
+        "config_file_exists": os.path.exists(_config_file()),
+        "gaps": gaps,
+    }
+    if not configured:
+        state["needs_setup"] = True
+        state["next_step"] = setup_hint
+        state["guidance"] = (
+            "cambium isn't configured yet. Offer the user setup: call setup() "
+            "with the absolute path to their project git clone and an agent id. "
+            "Environment variables override the config file when both are set.")
+    return state
+
+
+def _require_cfg():
+    """(_cfg(), None) when configured, else (None, helpful-guidance-JSON). Lets a
+    tool fail helpful in two lines instead of raising a bare env error."""
+    try:
+        return _cfg(), None
+    except ConfigError:
+        return None, json.dumps(_config_state(), indent=2)
 
 
 # --------------------------------------------------------------------------- #
@@ -754,11 +892,13 @@ def capture(content: str, type: str = "memory", kind: str = "note",
     tags        : comma/space-separated keywords (boost recall matching)
     valid_while : optional premise this knowledge depends on, e.g. "while we're
                   on NetSuite" — surfaced later so a dead assumption is spottable"""
+    cfg, err = _require_cfg()
+    if err:
+        return err
     if type not in VALID_TYPES:
         return json.dumps({"error": f"type must be one of {', '.join(VALID_TYPES)}"})
     if not content.strip():
         return json.dumps({"error": "content must not be empty"})
-    cfg = _cfg()
     data = _read_local(cfg)
     item = _new_item(cfg, content.strip(), type, kind, why.strip(),
                      _parse_tags(tags), {"system": "manual", "ref": ""})
@@ -802,7 +942,9 @@ def distill() -> str:
     completion events and captured-once-at-completion is the result. The residual
     gap: a done state that lives and dies entirely between two runs is never
     observed (only the agentsync git log holds it)."""
-    cfg = _cfg()
+    cfg, err = _require_cfg()
+    if err:
+        return err
     data = _read_local(cfg)
     imported_as = set(data["imported"]["agentsync"])
     imported_ck = set(data["imported"]["context_keeper"])
@@ -935,7 +1077,9 @@ def import_memory(source: str, path: str) -> str:
     they earn team/org the normal way, through recall usage and endorsement.
 
     Returns a summary: imported / skipped / duplicates."""
-    cfg = _cfg()
+    cfg, err = _require_cfg()
+    if err:
+        return err
     adapter = IMPORT_ADAPTERS.get(source)
     if adapter is None:
         return json.dumps({"error": f"unknown source '{source}'. available: "
@@ -989,7 +1133,9 @@ def recall(query: str, scope: str = "auto", limit: int = 5) -> str:
     best-effort via the shared branch) — usage is the trust signal promotion
     feeds on. If nothing clears the relevance floor the response says
     no_confident_match: true — don't present weak matches as established fact."""
-    cfg = _cfg()
+    cfg, err = _require_cfg()
+    if err:
+        return err
     limit = max(1, min(int(limit), 25))
     q = _tokens(query)
     scopes = ["local", "team", "org"] if scope == "auto" else [scope]
@@ -1064,7 +1210,9 @@ def endorse(item_id: str, note: str = "") -> str:
     """Vouch for an item — the strong trust signal. One endorsement fast-tracks
     local->team promotion and is REQUIRED for team->org (usage alone never
     reaches org; someone has to deliberately say 'this is right')."""
-    cfg = _cfg()
+    cfg, err = _require_cfg()
+    if err:
+        return err
     stamp = {"by": cfg["agent"], "at": _now(), "note": note}
 
     data = _read_local(cfg)
@@ -1102,7 +1250,9 @@ def verify_entry(item_id: str, note: str = "") -> str:
     after. An optional note records what was confirmed. Absent/old last_verified
     is a signal (see stale_report), never an automatic downgrade. Works on local
     and team entries; find stale ones with stale_report()."""
-    cfg = _cfg()
+    cfg, err = _require_cfg()
+    if err:
+        return err
     when = _now()
 
     data = _read_local(cfg)
@@ -1141,7 +1291,9 @@ def promote(item_id: str = "", to_scope: str = "", force: bool = False) -> str:
     endorsement; team->org always needs an endorsement (force=True overrides,
     use deliberately). Org promotion lands as a direct push, or as a pull
     request when CAMBIUM_ORG_PR=1 — the PR review is the org trust gate."""
-    cfg = _cfg()
+    cfg, err = _require_cfg()
+    if err:
+        return err
 
     # ---- explicit team -> org ------------------------------------------- #
     if item_id and to_scope == "org":
@@ -1241,7 +1393,9 @@ def review_promotions() -> str:
     """What's ready to move up? Lists local items eligible for team, team items
     eligible for org (endorsed), and org PRs already opened. The human-readable
     checkpoint before running promote()."""
-    cfg = _cfg()
+    cfg, err = _require_cfg()
+    if err:
+        return err
     local = _read_local(cfg)["items"]
     team = _read_team(cfg)
     def brief(i):
@@ -1284,7 +1438,9 @@ def stale_report(project: str = "", older_than_days: int = 0) -> str:
     Event-driven, not clock-driven: this reports absent/old verification events,
     it does NOT compute a decaying confidence score. Re-confirm with
     verify_entry(); promotion also counts as a verification."""
-    cfg = _cfg()
+    cfg, err = _require_cfg()
+    if err:
+        return err
     older_than_days = max(0, int(older_than_days))
     pool = [("team", i) for i in _read_team(cfg)]
     if cfg["org_repo"]:
@@ -1319,9 +1475,15 @@ def stale_report(project: str = "", older_than_days: int = 0) -> str:
 
 @mcp.tool()
 def status() -> str:
-    """Overview: item counts per scope and type, distill watermarks, and which
-    substrates (agentsync branch, .context/, org repo) are actually wired up.
-    Run this first when something looks off."""
+    """First thing to call — especially when cambium looks broken. Returns
+    structured config state: what's set, what's missing, what each gap costs in
+    plain terms, and the exact setup() call that fixes it. NEVER raises on
+    missing config. When fully configured it also reports item counts per
+    scope/type, distill watermarks, and which substrates are actually wired."""
+    state = _config_state()
+    if not state["configured"]:
+        return json.dumps(state, indent=2)  # pure guidance — touches no git
+
     cfg = _cfg()
     local = _read_local(cfg)
     team = _read_team(cfg)
@@ -1333,27 +1495,151 @@ def status() -> str:
             by_type[i.get("type", "?")] = by_type.get(i.get("type", "?"), 0) + 1
         return {"total": len(items), "by_type": by_type}
 
-    return json.dumps(
-        {
-            "me": cfg["agent"],
-            "project": cfg["project"],
-            "scopes": {"local": count(local["items"]), "team": count(team),
-                       "org": count(org) if cfg["org_repo"] else "not configured"},
-            "imported": {"context_keeper": len(local["imported"]["context_keeper"]),
-                         "agentsync": len(local["imported"]["agentsync"]),
-                         "import": len(local["imported"]["import"])},
-            "substrates": {
-                "agentsync_branch": cfg["agentsync_branch"],
-                "context_dir": os.path.isdir(cfg["context_dir"]),
-                "team_branch": cfg["team_branch"],
-                "org_repo": cfg["org_repo"] or None,
-                "org_mode": "pull-request" if cfg["org_pr"] else "direct-push",
-            },
-            "release_capture": cfg["release_capture"],
-            "promote_threshold_recalls": cfg["promote_recalls"],
+    state.update({
+        "scopes": {"local": count(local["items"]), "team": count(team),
+                   "org": count(org) if cfg["org_repo"] else "not configured"},
+        "imported": {"context_keeper": len(local["imported"]["context_keeper"]),
+                     "agentsync": len(local["imported"]["agentsync"]),
+                     "import": len(local["imported"]["import"])},
+        "substrates": {
+            "agentsync_branch": cfg["agentsync_branch"],
+            "context_dir": os.path.isdir(cfg["context_dir"]),
+            "team_branch": cfg["team_branch"],
+            "org_repo": cfg["org_repo"] or None,
+            "org_mode": "pull-request" if cfg["org_pr"] else "direct-push",
         },
-        indent=2,
-    )
+        "release_capture": cfg["release_capture"],
+        "promote_threshold_recalls": cfg["promote_recalls"],
+    })
+    return json.dumps(state, indent=2)
+
+
+# --------------------------------------------------------------------------- #
+# setup — the one tool that works BEFORE cambium is configured. It validates,
+# scaffolds .cambium/, and writes the fallback config the server reads when env
+# vars are absent (env still wins). It never runs org-repo creation unprompted.
+#
+# TODO(follow-up): fold in friction notes from the first real cycle
+# (context-keeper, cambium project). A parallel session is generating those now;
+# they get integrated in a follow-up pass — tune the gap costs, setup prompts,
+# and org guidance here against what actually tripped up the first onboarding.
+# --------------------------------------------------------------------------- #
+def _gh_available():
+    from shutil import which
+    return which("gh") is not None
+
+
+def _org_setup_advice(name):
+    """Exact commands to stand up an org knowledge repo — to RETURN, not run.
+    cambium never creates or pushes someone's repo unprompted."""
+    slug = name.rstrip("/").split("/")[-1] or "knowledge"
+    clone = f"/abs/path/to/{slug}"
+    return [
+        f"gh repo create {name} --private        # or create it in the GitHub UI",
+        f"git clone https://github.com/{name}.git {clone}",
+        f"printf '{{\"items\": []}}' > {clone}/knowledge.json",
+        f"git -C {clone} add knowledge.json && "
+        f"git -C {clone} commit -m 'init org knowledge' && git -C {clone} push",
+        f'then re-run: setup(project_repo="…", agent_id="…", org_repo="{clone}")',
+    ]
+
+
+def _ensure_gitignored(repo, entry):
+    """Append `entry` to the repo's .gitignore if absent. Returns True if added.
+    Keeps the local knowledge store (and anything else under .cambium/) out of
+    version control — no secrets, no per-machine paths committed."""
+    gi = os.path.join(repo, ".gitignore")
+    lines = []
+    if os.path.exists(gi):
+        with open(gi, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    if entry in lines or entry.rstrip("/") in lines:
+        return False
+    with open(gi, "a", encoding="utf-8") as f:
+        if lines and lines[-1].strip():
+            f.write("\n")
+        f.write(entry + "\n")
+    return True
+
+
+@mcp.tool()
+def setup(project_repo: str, agent_id: str, org_repo: str = "",
+          org_pr: bool = False, team_branch: str = "") -> str:
+    """Finish cambium's setup in one call — the tool status() and every
+    unconfigured error point you to. Validates paths, scaffolds .cambium/ (and
+    gitignores it), and writes a local fallback config the server reads when env
+    vars are absent (env still wins when set, and it takes effect immediately —
+    no restart).
+
+    project_repo : absolute path to your project's git clone (required)
+    agent_id     : your unique agent id (required)
+    org_repo     : optional — a local clone path, OR a GitHub 'owner/name'. If a
+                   name isn't cloned locally, setup OFFERS the exact gh/git
+                   commands to stand it up and leaves org scope off; it never
+                   creates or pushes a repo for you.
+    org_pr       : optional — org promotion opens a pull request instead of a
+                   direct push.
+    team_branch  : optional — override the team-scope branch (default 'cambium').
+
+    No secrets are written anywhere; the config file holds only paths, ids, and
+    flags, and lives outside any repo."""
+    repo = _abspath(project_repo)
+    if not project_repo.strip() or not os.path.isdir(repo):
+        return json.dumps({"error": f"project_repo not found: {repo!r}. Pass the "
+                           "absolute path to an existing git clone."})
+    if not os.path.isdir(os.path.join(repo, ".git")):
+        return json.dumps({"error": f"{repo} is not a git repository (no .git). "
+                           "Point setup() at a git clone — cambium stores "
+                           "knowledge in git."})
+    if not agent_id.strip():
+        return json.dumps({"error": "agent_id must not be empty."})
+    agent_id = agent_id.strip()
+
+    # scaffold the local store dir and keep it out of version control
+    os.makedirs(os.path.join(repo, LOCAL_DIR), exist_ok=True)
+    gitignored = _ensure_gitignored(repo, LOCAL_DIR + "/")
+
+    # org: offer-but-don't-assume
+    org_result = None
+    org_value = ""
+    if org_repo.strip():
+        given = org_repo.strip()
+        cand = _abspath(given)
+        if os.path.isdir(os.path.join(cand, ".git")):
+            org_value = cand  # a real local clone — wire it up
+        else:
+            org_result = {
+                "status": "not_created",
+                "given": given,
+                "note": "org scope stays OFF until this resolves to a local git "
+                        "clone; cambium will not create or push it for you",
+                "gh_available": _gh_available(),
+                "run_these_yourself": _org_setup_advice(given),
+            }
+
+    # write the fallback config (paths / ids / flags only — never secrets)
+    conf = {"CAMBIUM_REPO": repo, "CAMBIUM_AGENT_ID": agent_id}
+    if org_value:
+        conf["CAMBIUM_ORG_REPO"] = org_value
+    if org_pr:
+        conf["CAMBIUM_ORG_PR"] = "1"
+    if team_branch.strip():
+        conf["CAMBIUM_TEAM_BRANCH"] = team_branch.strip()
+    _write_config_file(conf)
+
+    result = {
+        "status": "configured",
+        "config_file": _config_file(),
+        "wrote": sorted(conf.keys()),
+        "scaffolded": os.path.join(repo, LOCAL_DIR),
+        "gitignored": (LOCAL_DIR + "/") if gitignored else "already ignored",
+        "note": "env vars override this file when set; it takes effect "
+                "immediately — no restart needed",
+    }
+    if org_result:
+        result["org_repo"] = org_result
+    result["state"] = _config_state()  # reflects the just-written config
+    return json.dumps(result, indent=2)
 
 
 if __name__ == "__main__":

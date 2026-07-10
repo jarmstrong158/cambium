@@ -33,7 +33,7 @@ AGENTSYNC_PATH = os.path.join(os.path.dirname(HERE), "agentsync",
 CAMBIUM_ENV = [
     "CAMBIUM_REPO", "CAMBIUM_AGENT_ID", "CAMBIUM_ORG_REPO", "CAMBIUM_ORG_PR",
     "CAMBIUM_PROMOTE_RECALLS", "CAMBIUM_TEAM_BRANCH", "CAMBIUM_AGENTSYNC_BRANCH",
-    "CAMBIUM_RELEASE_CAPTURE",
+    "CAMBIUM_RELEASE_CAPTURE", "CAMBIUM_CONFIG_FILE",
 ]
 
 
@@ -104,8 +104,22 @@ def be(clones, who, **extra):
         os.environ.pop(k, None)
     os.environ["CAMBIUM_REPO"] = clones[who]
     os.environ["CAMBIUM_AGENT_ID"] = who
+    # point the fallback config at a per-lab path that does not exist, so tests
+    # never read (or write) the developer's real ~/.cambium/config.json
+    os.environ["CAMBIUM_CONFIG_FILE"] = os.path.join(
+        os.path.dirname(clones[who]), "cambium_test_config.json")
     for k, v in extra.items():
         os.environ[k] = v
+
+
+def unconfigured(root, config_name="empty_config.json"):
+    """Clear all cambium env and point the fallback config at a nonexistent file
+    under `root` — cambium sees a completely cold, unconfigured start."""
+    for k in CAMBIUM_ENV:
+        os.environ.pop(k, None)
+    path = os.path.join(root, config_name)
+    os.environ["CAMBIUM_CONFIG_FILE"] = path
+    return path
 
 
 def seed_agentsync_branch(clone, claims):
@@ -953,6 +967,124 @@ def test_real_agentsync_release_capture():
 
 
 # --------------------------------------------------------------------------- #
+# onboarding — helpful first contact when unconfigured (status / fail-helpful /
+# setup)
+# --------------------------------------------------------------------------- #
+def test_status_reports_gaps_when_unconfigured():
+    with lab() as (root, origin, clones):
+        unconfigured(root)
+        s = json.loads(M.status())  # must not raise
+        assert s["configured"] is False, s
+        settings = {g["setting"] for g in s["gaps"]}
+        assert {"CAMBIUM_REPO", "CAMBIUM_AGENT_ID"} <= settings, s
+        # every gap states a plain-terms cost and the exact setup() fix
+        assert all(g.get("cost") and "setup(" in g.get("fix", "")
+                   for g in s["gaps"]), s
+        assert "setup(" in s["next_step"], s
+
+
+def test_every_tool_fails_helpful_when_unconfigured():
+    with lab() as (root, origin, clones):
+        unconfigured(root)
+        tools = [
+            ("capture", lambda: M.capture("x")),
+            ("record_need", lambda: M.record_need("x")),
+            ("distill", lambda: M.distill()),
+            ("import_memory", lambda: M.import_memory("json", "/no/file")),
+            ("recall", lambda: M.recall("x")),
+            ("endorse", lambda: M.endorse("k-1")),
+            ("verify_entry", lambda: M.verify_entry("k-1")),
+            ("promote", lambda: M.promote()),
+            ("review_promotions", lambda: M.review_promotions()),
+            ("stale_report", lambda: M.stale_report()),
+            ("status", lambda: M.status()),
+        ]
+        for name, call in tools:
+            r = json.loads(call())  # none may raise
+            assert r.get("configured") is False, f"{name}: {r}"
+            assert r.get("needs_setup") is True, f"{name}: {r}"
+            assert "setup(" in r.get("next_step", ""), f"{name}: {r}"
+
+
+def test_setup_configures_from_cold_start():
+    with lab() as (root, origin, clones):
+        cfgfile = unconfigured(root, "home_config.json")
+        r = json.loads(M.setup(project_repo=clones["jonny"], agent_id="jonny"))
+        assert r["status"] == "configured", r
+        assert os.path.exists(cfgfile), "fallback config written"
+        # scaffolding + gitignore in the project repo
+        assert os.path.isdir(os.path.join(clones["jonny"], ".cambium"))
+        gi = open(os.path.join(clones["jonny"], ".gitignore"),
+                  encoding="utf-8").read()
+        assert ".cambium" in gi, gi
+        # no secrets in the written config — only paths/ids/flags
+        conf = json.load(open(cfgfile, encoding="utf-8"))
+        assert conf["CAMBIUM_AGENT_ID"] == "jonny" and conf["CAMBIUM_REPO"], conf
+        assert not any(bad in k.upper() for k in conf
+                       for bad in ("TOKEN", "SECRET", "PASSWORD", "KEY")), conf
+        # server now resolves from the file with NO env repo/agent set
+        assert "CAMBIUM_REPO" not in os.environ
+        s = json.loads(M.status())
+        assert s["configured"] is True and s["me"] == "jonny", s
+        # and a real tool works end to end, immediately (no restart)
+        assert json.loads(M.capture("first note after setup"))["status"] == "captured"
+
+
+def test_setup_env_overrides_config_file():
+    with lab() as (root, origin, clones):
+        unconfigured(root, "home_config.json")
+        M.setup(project_repo=clones["jonny"], agent_id="jonny")
+        # env names a different agent — env must win over the file
+        os.environ["CAMBIUM_AGENT_ID"] = "override-agent"
+        s = json.loads(M.status())
+        assert s["me"] == "override-agent", s
+        assert s["config_source"]["CAMBIUM_AGENT_ID"] == "env", s
+        assert s["config_source"]["CAMBIUM_REPO"] == "config-file", s
+
+
+def test_setup_offers_org_commands_without_creating():
+    with lab() as (root, origin, clones):
+        unconfigured(root, "home_config.json")
+        # a GitHub-style name that isn't cloned locally
+        r = json.loads(M.setup(project_repo=clones["jonny"], agent_id="jonny",
+                               org_repo="myorg/knowledge"))
+        assert r["status"] == "configured", r
+        org = r.get("org_repo", {})
+        assert org.get("status") == "not_created", r
+        cmds = " ".join(org.get("run_these_yourself", []))
+        assert "gh repo create myorg/knowledge" in cmds, org
+        # org scope stayed OFF (not recorded) → the org gap persists
+        s = json.loads(M.status())
+        assert any(g["setting"] == "CAMBIUM_ORG_REPO" for g in s["gaps"]), s
+        assert "CAMBIUM_ORG_REPO" not in json.load(
+            open(os.environ["CAMBIUM_CONFIG_FILE"], encoding="utf-8"))
+
+
+def test_setup_wires_a_local_org_clone():
+    with lab() as (root, origin, clones):
+        org_bare, org_clone = setup_org_repo(root)
+        unconfigured(root, "home_config.json")
+        r = json.loads(M.setup(project_repo=clones["jonny"], agent_id="jonny",
+                               org_repo=org_clone))
+        assert r["status"] == "configured" and "org_repo" not in r, r
+        s = json.loads(M.status())
+        # org now configured -> no org gap, org scope reported
+        assert not any(g["setting"] == "CAMBIUM_ORG_REPO" for g in s["gaps"]), s
+
+
+def test_setup_rejects_non_git_and_missing_paths():
+    with lab() as (root, origin, clones):
+        unconfigured(root)
+        assert "error" in json.loads(M.setup(project_repo="/no/such/dir",
+                                             agent_id="jonny"))
+        plain = os.path.join(root, "plain")          # a dir but not a git clone
+        os.makedirs(plain, exist_ok=True)
+        assert "error" in json.loads(M.setup(project_repo=plain, agent_id="jonny"))
+        assert "error" in json.loads(M.setup(project_repo=clones["jonny"],
+                                             agent_id="   "))
+
+
+# --------------------------------------------------------------------------- #
 # real MCP stdio transport — the server as a client actually runs it
 # --------------------------------------------------------------------------- #
 def _mcp_drive(server_env, calls, timeout=90):
@@ -990,6 +1122,7 @@ def test_mcp_transport_capture_distill_recall():
             env.pop(k, None)
         env["CAMBIUM_REPO"] = clones["jonny"]
         env["CAMBIUM_AGENT_ID"] = "jonny"
+        env["CAMBIUM_CONFIG_FILE"] = os.path.join(root, "transport_config.json")
         out = _mcp_drive(env, [
             ("capture", {"content": "release train leaves fridays at noon",
                          "tags": "release process"}),
@@ -1045,6 +1178,13 @@ TESTS = [
     test_full_compound_growth_loop,
     test_team_cas_survives_concurrent_push,
     test_status_overview,
+    test_status_reports_gaps_when_unconfigured,
+    test_every_tool_fails_helpful_when_unconfigured,
+    test_setup_configures_from_cold_start,
+    test_setup_env_overrides_config_file,
+    test_setup_offers_org_commands_without_creating,
+    test_setup_wires_a_local_org_clone,
+    test_setup_rejects_non_git_and_missing_paths,
     test_real_agentsync_integration,
     test_real_agentsync_release_capture,
     test_mcp_transport_capture_distill_recall,
