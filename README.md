@@ -172,6 +172,15 @@ sorted oldest-verified-first, never-reverified ones flagged, each entry's
 **`review_promotions()`** — what's eligible for team, what's endorsed for org,
 which org PRs are pending.
 
+**`export_markdown(scope)`** — render knowledge to a human-readable
+`KNOWLEDGE.md`, grouped by scope then project (each item: summary, kind,
+provenance `dec-NNN`/claim origin, recall count, promoted date; cp1252 mojibake
+normalized). `scope="org"` (default) re-renders and pushes the org repo's
+`KNOWLEDGE.md` beside its `knowledge.json`; `local`/`team`/`all` return the
+markdown without publishing. It also runs **automatically after any org
+promotion** — direct-push commits both files together, PR mode puts both on the
+same PR branch — so the org repo's docs are always current.
+
 **`setup(project_repo, agent_id, org_repo?, org_pr?, team_branch?)`** — finish
 configuration from a cold start (see *Configure*). Validates paths, scaffolds
 `.cambium/`, writes the fallback config; offers `gh` commands for an org repo
@@ -288,7 +297,10 @@ never an automatic downgrade. cambium reports the smell; a person decides.
 python3 test_cambium.py
 ```
 
-46 cases against real git repos: **onboarding** (unconfigured `status()` reports
+51 cases against real git repos: **markdown export** (`KNOWLEDGE.md` grouped by
+scope then project with provenance/recalls/promoted-date, cp1252 mojibake
+normalized, auto-written alongside `knowledge.json` on org promotion in both
+direct-push and PR modes), **onboarding** (unconfigured `status()` reports
 gaps with costs and fixes, every tool fails helpful when unconfigured, `setup()`
 configures from a cold start and its config takes effect in-process, env
 overrides the file, org names are offered as `gh` commands not created, non-git

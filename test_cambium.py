@@ -545,6 +545,35 @@ def seed_team_items(items):
     assert M._team_mutate(M._cfg(), add, "test: seed team items")
 
 
+def org_item(iid, content, project, kind="note", system="manual", ref="",
+             recalls=0, last_verified="2026-06-01T00:00:00+00:00", why=""):
+    """An org-scope knowledge item shaped exactly like a promoted one."""
+    return {"id": iid, "type": "memory", "kind": kind, "content": content,
+            "why": why, "tags": [], "scope": "org", "project": project,
+            "source": {"system": system, "ref": ref}, "created_by": "t",
+            "created_at": "2026-01-01T00:00:00+00:00", "updated_at": last_verified,
+            "status": "active", "last_verified": last_verified,
+            "trust": {"recalls": recalls, "endorsements": [],
+                      "projects": [project]}}
+
+
+def seed_org_items(org_clone, items):
+    """Append items to the org repo's knowledge.json on its origin (no
+    KNOWLEDGE.md yet), so export can be exercised against a real org repo."""
+    git(["fetch", "-q", "origin"], org_clone)
+    git(["checkout", "-q", "main"], org_clone)
+    git(["reset", "--hard", "origin/main"], org_clone)
+    path = os.path.join(org_clone, "knowledge.json")
+    data = json.load(open(path, encoding="utf-8")) if os.path.exists(path) \
+        else {"items": []}
+    data["items"].extend(items)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    git(["add", "knowledge.json"], org_clone)
+    git(["commit", "-qm", "seed org items"], org_clone)
+    git(["push", "-q", "origin", "main"], org_clone)
+
+
 def test_optional_staleness_fields_absent_are_handled():
     with lab() as (root, origin, clones):
         be(clones, "jonny")
@@ -793,6 +822,116 @@ def test_promote_to_org_via_pull_request():
         assert all(x["id"] != item_id for x in rp["eligible_for_org"]), rp
 
 
+# --------------------------------------------------------------------------- #
+# export_markdown — human-readable KNOWLEDGE.md
+# --------------------------------------------------------------------------- #
+def test_export_markdown_publishes_grouped_with_provenance():
+    with lab() as (root, origin, clones):
+        org_bare, org_clone = setup_org_repo(root)
+        be(clones, "jonny", CAMBIUM_ORG_REPO=org_clone)
+        seed_org_items(org_clone, [
+            org_item("k-dec", "Use argon2id for password hashing", "auth-svc",
+                     kind="decision", system="context-keeper", ref="dec-001",
+                     recalls=5, why="OWASP first choice"),
+            org_item("k-out", "Stripe webhooks verified via signature header",
+                     "pay-svc", kind="outcome", system="agentsync",
+                     ref="stobie:stobie/pay", recalls=2),
+        ])
+        r = json.loads(M.export_markdown())
+        assert r["published"] is True and r["detail"] == "pushed", r
+        md = r["markdown"]
+        # grouped by scope then project
+        assert "## org scope" in md, md
+        assert "### auth-svc" in md and "### pay-svc" in md, md
+        # each item: summary, kind, provenance (dec-NNN / claim origin), recalls,
+        # promoted date
+        assert "Use argon2id for password hashing" in md, md
+        assert "kind: `decision`" in md, md
+        assert "context-keeper dec-001" in md, md
+        assert "agentsync claim stobie:stobie/pay" in md, md
+        assert "recalls: 5" in md and "promoted: 2026-06-01" in md, md
+        # actually published to the org origin
+        p = git(["show", "origin/main:KNOWLEDGE.md"], org_clone)
+        assert p.returncode == 0 and "argon2id" in p.stdout, p.stdout
+
+
+def test_export_normalizes_cp1252_mojibake():
+    with lab() as (root, origin, clones):
+        org_bare, org_clone = setup_org_repo(root)
+        be(clones, "jonny", CAMBIUM_ORG_REPO=org_clone)
+        # the classic UTF-8-as-cp1252 em-dash mojibake: "—" -> "â€”"
+        bad = "Use Postgres â€” never MySQL for new services"
+        seed_org_items(org_clone, [org_item("k-moji", bad, "db-svc")])
+        md = json.loads(M.export_markdown())["markdown"]
+        assert "Use Postgres — never MySQL" in md, repr(md)   # em dash restored
+        assert "â€”" not in md, repr(md)            # mojibake gone
+
+
+def test_org_promotion_writes_knowledge_md_alongside_json():
+    with lab() as (root, origin, clones):
+        org_bare, org_clone = setup_org_repo(root)
+        be(clones, "jonny", CAMBIUM_ORG_REPO=org_clone, CAMBIUM_PROMOTE_RECALLS="1")
+        iid = json.loads(M.capture("All services log in UTC, never local time",
+                                   kind="constraint", tags="time"))["item"]["id"]
+        M.recall("utc log time")           # 1 recall -> team-eligible
+        M.promote()
+        M.endorse(iid, note="org-wide")
+        r = json.loads(M.promote(item_id=iid, to_scope="org"))
+        assert r["status"] == "promoted", r
+        # KNOWLEDGE.md exists on the org origin and reflects the promotion
+        md = git(["show", "origin/main:KNOWLEDGE.md"], org_clone)
+        assert md.returncode == 0, md.stderr
+        assert "## org scope" in md.stdout and "UTC" in md.stdout, md.stdout
+        assert "kind: `constraint`" in md.stdout, md.stdout
+        # the same commit carried BOTH files
+        show = git(["show", "--name-only", "--pretty=format:", "origin/main"],
+                   org_clone)
+        assert "KNOWLEDGE.md" in show.stdout and "knowledge.json" in show.stdout, \
+            show.stdout
+
+
+def test_org_pr_mode_puts_knowledge_md_on_the_pr_branch():
+    with lab() as (root, origin, clones):
+        org_bare, org_clone = setup_org_repo(root)
+        be(clones, "jonny", CAMBIUM_ORG_REPO=org_clone, CAMBIUM_ORG_PR="1",
+           CAMBIUM_PROMOTE_RECALLS="1")
+        iid = json.loads(M.capture("API errors follow RFC 7807",
+                                   tags="api errors"))["item"]["id"]
+        M.endorse(iid)
+        M.promote()
+        orig = M._gh
+        def fake_gh(args, cwd=None, check=True):
+            if args[:2] == ["pr", "create"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="https://github.com/org/knowledge/pull/7\n", stderr="")
+            raise AssertionError(f"unexpected gh call: {args}")
+        M._gh = fake_gh
+        try:
+            r = json.loads(M.promote(item_id=iid, to_scope="org"))
+        finally:
+            M._gh = orig
+        assert r["status"] == "pr_opened", r
+        pr_branch = f"cambium/promote-{iid}"
+        md = git(["show", f"origin/{pr_branch}:KNOWLEDGE.md"], org_clone)
+        assert md.returncode == 0 and "RFC 7807" in md.stdout, md.stdout
+        # both files on the same PR branch
+        show = git(["show", "--name-only", "--pretty=format:",
+                    f"origin/{pr_branch}"], org_clone)
+        assert "KNOWLEDGE.md" in show.stdout and "knowledge.json" in show.stdout, \
+            show.stdout
+
+
+def test_export_markdown_local_and_team_render_without_publishing():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.capture("local-only note about the build", tags="build")
+        r = json.loads(M.export_markdown(scope="local"))
+        assert r["published"] is False and r["status"] == "rendered", r
+        assert "## local scope" in r["markdown"], r
+        assert "local-only note about the build" in r["markdown"], r
+
+
 def test_review_promotions_lists_eligible():
     with lab() as (root, origin, clones):
         be(clones, "jonny", CAMBIUM_PROMOTE_RECALLS="1")
@@ -997,6 +1136,7 @@ def test_every_tool_fails_helpful_when_unconfigured():
             ("promote", lambda: M.promote()),
             ("review_promotions", lambda: M.review_promotions()),
             ("stale_report", lambda: M.stale_report()),
+            ("export_markdown", lambda: M.export_markdown()),
             ("status", lambda: M.status()),
         ]
         for name, call in tools:
@@ -1175,6 +1315,11 @@ TESTS = [
     test_promote_team_to_org_requires_endorsement,
     test_promote_to_org_via_pull_request,
     test_review_promotions_lists_eligible,
+    test_export_markdown_publishes_grouped_with_provenance,
+    test_export_normalizes_cp1252_mojibake,
+    test_org_promotion_writes_knowledge_md_alongside_json,
+    test_org_pr_mode_puts_knowledge_md_on_the_pr_branch,
+    test_export_markdown_local_and_team_render_without_publishing,
     test_full_compound_growth_loop,
     test_team_cas_survives_concurrent_push,
     test_status_overview,

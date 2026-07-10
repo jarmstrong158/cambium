@@ -65,6 +65,7 @@ from mcp.server.fastmcp import FastMCP
 mcp = FastMCP("cambium")
 
 KNOWLEDGE_FILE = "knowledge.json"
+KNOWLEDGE_MD = "KNOWLEDGE.md"   # human-readable render of a knowledge store
 LOCAL_DIR = ".cambium"
 PUSH_RETRIES = 5
 RELEVANCE_FLOOR = 0.2  # below this, recall says "no confident match"
@@ -264,6 +265,10 @@ def _git(args, cwd, check=True):
     try:
         p = subprocess.run(
             ["git", *args], cwd=cwd, capture_output=True, text=True,
+            # Decode git output as UTF-8 regardless of the host locale — on a
+            # cp1252 (Windows) locale, text=True would mis-decode UTF-8 bytes and
+            # turn em dashes / curly quotes into mojibake on read.
+            encoding="utf-8", errors="replace",
             env=_noninteractive_env(), timeout=GIT_TIMEOUT,
             stdin=subprocess.DEVNULL,  # never inherit the MCP stdio pipe
         )
@@ -494,7 +499,9 @@ def _org_add_direct(cfg, item):
         data["items"].append(item)
         with open(os.path.join(repo, KNOWLEDGE_FILE), "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
-        _git(["add", KNOWLEDGE_FILE], repo)
+        # keep the human-readable render current, committed alongside the JSON
+        _write_knowledge_md(repo, data["items"])
+        _git(["add", KNOWLEDGE_FILE, KNOWLEDGE_MD], repo)
         _git(["commit", "-m", f"cambium: promote {item['id']} to org "
               f"({item['content'][:50]!r})"], repo)
         push = _git(["push", "origin", branch], repo, check=False)
@@ -516,8 +523,11 @@ def _org_add_pr(cfg, item):
         data["items"].append(item)
         with open(os.path.join(repo, KNOWLEDGE_FILE), "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
-    _git(["add", KNOWLEDGE_FILE], repo)
-    _git(["commit", "-m", f"cambium: promote {item['id']} to org"], repo)
+    # render KNOWLEDGE.md onto the same PR branch so review sees both together
+    _write_knowledge_md(repo, data["items"])
+    _git(["add", KNOWLEDGE_FILE, KNOWLEDGE_MD], repo)
+    if _git(["status", "--porcelain"], repo).stdout.strip():
+        _git(["commit", "-m", f"cambium: promote {item['id']} to org"], repo)
     push = _git(["push", "-f", "origin", pr_branch], repo, check=False)
     _git(["checkout", "-q", base], repo, check=False)
     if push.returncode != 0:
@@ -540,6 +550,128 @@ def _org_add_pr(cfg, item):
     if view.returncode == 0 and view.stdout.strip():
         return True, view.stdout.strip()
     return False, f"PR creation failed: {created.stderr.strip()[:200]}"
+
+
+# --------------------------------------------------------------------------- #
+# human-readable export — render a knowledge store to KNOWLEDGE.md
+# --------------------------------------------------------------------------- #
+def _demojibake(s):
+    """Repair the classic cp1252 mojibake where UTF-8 bytes were decoded as
+    Windows-1252 (em dashes / en dashes / curly quotes / ellipses come back as
+    'â€"', 'â€™', …). Guarded: only re-decodes when a tell-tale lead byte is
+    present AND the round-trip is clean, so correct text is never corrupted."""
+    if not isinstance(s, str) or not s:
+        return s
+    if "Ã" not in s and "â" not in s:  # Ã / â — the mojibake tell
+        return s
+    try:
+        repaired = s.encode("cp1252").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return s  # not this mojibake (chars outside cp1252, or not valid UTF-8)
+    return repaired
+
+
+def _oneline(s):
+    """Clean, single-line text for a markdown cell: demojibake + collapse space."""
+    return " ".join(_demojibake(s or "").split())
+
+
+def _provenance(item):
+    """Where this knowledge came from, in human terms: context-keeper dec-NNN,
+    an agentsync claim, a manual capture, or an import."""
+    src = item.get("source", {}) or {}
+    system = src.get("system") or "unknown"
+    ref = _oneline(src.get("ref") or "")
+    if src.get("imported"):
+        return f"imported from {system}" + (f" ({ref})" if ref else "")
+    if system == "context-keeper":
+        return f"context-keeper {ref}" if ref else "context-keeper"
+    if system == "agentsync":
+        return f"agentsync claim {ref}" if ref else "agentsync"
+    if system == "manual":
+        return "manual capture"
+    return (f"{system} {ref}").strip()
+
+
+def _promoted_date(item):
+    """The date this item was promoted, YYYY-MM-DD. Prefers the PR-promotion
+    stamp, then last_verified (promotion sets it), then updated_at."""
+    raw = ((item.get("promotion") or {}).get("at")
+           or item.get("last_verified") or item.get("updated_at") or "")
+    return raw[:10] if isinstance(raw, str) and raw else ""
+
+
+_SCOPE_ORDER = {"local": 0, "team": 1, "org": 2}
+
+
+def _render_markdown(items, title="Knowledge"):
+    """Render knowledge items to KNOWLEDGE.md text: grouped by scope then
+    project, each item showing summary, kind, provenance, recall count and
+    promoted date. Deterministic ordering (most-recalled first) so re-exports
+    produce stable diffs. All text is demojibake-cleaned."""
+    lines = [f"# {title}", "",
+             "_Generated by cambium from `knowledge.json` — do not edit by hand; "
+             "it is overwritten on the next export._", ""]
+    active = [i for i in items if i.get("status", "active") == "active"]
+    if not active:
+        lines += ["_No active knowledge items yet._", ""]
+        return "\n".join(lines)
+
+    by_scope = {}
+    for i in active:
+        by_scope.setdefault(i.get("scope", "local"), {}).setdefault(
+            i.get("project") or "—", []).append(i)
+
+    for scope in sorted(by_scope, key=lambda s: (_SCOPE_ORDER.get(s, 9), s)):
+        lines += [f"## {scope} scope", ""]
+        projects = by_scope[scope]
+        for project in sorted(projects):
+            lines += [f"### {project}", ""]
+            entries = sorted(
+                projects[project],
+                key=lambda i: (-i.get("trust", {}).get("recalls", 0),
+                               _oneline(i.get("content", ""))))
+            for i in entries:
+                summary = _oneline(i.get("content", "")) or "(no summary)"
+                lines.append(f"- **{summary}**")
+                lines.append(f"  - kind: `{i.get('kind', 'note')}`")
+                lines.append(f"  - provenance: {_provenance(i)}")
+                lines.append(f"  - recalls: "
+                             f"{i.get('trust', {}).get('recalls', 0)}")
+                lines.append(f"  - promoted: {_promoted_date(i) or '—'}")
+                why = _oneline(i.get("why", ""))
+                if why:
+                    lines.append(f"  - why: {why}")
+                vw = _oneline(i.get("valid_while", ""))
+                if vw:
+                    lines.append(f"  - valid while: {vw}")
+                lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _write_knowledge_md(repo_dir, items, title="Knowledge"):
+    """Render items and write KNOWLEDGE.md into repo_dir. Returns the markdown."""
+    md = _render_markdown(items, title)
+    with open(os.path.join(repo_dir, KNOWLEDGE_MD), "w", encoding="utf-8") as f:
+        f.write(md)
+    return md
+
+
+def _org_publish_markdown(cfg):
+    """(Re)render the org repo's KNOWLEDGE.md from its knowledge.json and push
+    it. CAS like _org_add_direct. Returns (ok, detail, markdown)."""
+    repo, md = cfg["org_repo"], ""
+    for attempt in range(PUSH_RETRIES):
+        branch = _org_sync(cfg)
+        md = _write_knowledge_md(repo, _org_read_wt(cfg)["items"])
+        _git(["add", KNOWLEDGE_MD], repo)
+        if not _git(["status", "--porcelain"], repo).stdout.strip():
+            return True, "already current", md
+        _git(["commit", "-m", "cambium: refresh KNOWLEDGE.md"], repo)
+        if _git(["push", "origin", branch], repo, check=False).returncode == 0:
+            return True, "pushed", md
+        time.sleep(0.4 * (attempt + 1))
+    return False, "org push kept losing the race", md
 
 
 # --------------------------------------------------------------------------- #
@@ -1471,6 +1603,47 @@ def stale_report(project: str = "", older_than_days: int = 0) -> str:
         },
         indent=2,
     )
+
+
+@mcp.tool()
+def export_markdown(scope: str = "org") -> str:
+    """Render knowledge to a human-readable KNOWLEDGE.md — grouped by scope then
+    project, each item showing summary, kind, provenance (dec-NNN / claim
+    origin), recall count and promoted date. cp1252 mojibake (em dashes, curly
+    quotes) is normalized so the text is clean.
+
+    scope='org' (default): re-render the org knowledge repo's KNOWLEDGE.md from
+    its knowledge.json and commit + push it beside the JSON, so the org repo's
+    docs are always current. (This also runs automatically after any org
+    promotion — direct-push commits both files together; PR mode puts both on
+    the same PR branch.)
+
+    scope='local'|'team'|'all': render those scope(s) and RETURN the markdown
+    without publishing — there is no repo to publish local/team docs to."""
+    cfg, err = _require_cfg()
+    if err:
+        return err
+    if scope in ("local", "team", "all"):
+        items = []
+        if scope in ("local", "all"):
+            items += _read_local(cfg)["items"]
+        if scope in ("team", "all"):
+            items += _read_team(cfg)
+        if scope == "all" and cfg["org_repo"]:
+            items += _read_org(cfg)
+        return json.dumps({"status": "rendered", "scope": scope,
+                           "published": False,
+                           "markdown": _render_markdown(items)}, indent=2)
+    if scope != "org":
+        return json.dumps({"error": "scope must be org | local | team | all"})
+    if not cfg["org_repo"]:
+        return json.dumps({"error": "CAMBIUM_ORG_REPO is not configured — no org "
+                           "repo to publish KNOWLEDGE.md to. Configure org scope "
+                           "with setup(org_repo=…)."})
+    ok, detail, md = _org_publish_markdown(cfg)
+    return json.dumps({"status": "published" if ok else "failed", "scope": "org",
+                       "published": ok, "detail": detail, "file": KNOWLEDGE_MD,
+                       "markdown": md}, indent=2)
 
 
 @mcp.tool()
