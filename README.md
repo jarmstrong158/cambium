@@ -94,6 +94,7 @@ overrides the config file per-key — the table is the full reference layer:
 | `CAMBIUM_REPO` | yes | — | your project clone (local scope, agentsync + context-keeper substrates) |
 | `CAMBIUM_AGENT_ID` | yes | — | your unique agent id |
 | `CAMBIUM_REMOTE` | no | `origin` | git remote |
+| `CAMBIUM_GIT_TIMEOUT` | no | `25` | per-invocation git/gh timeout (seconds) so a stuck call fails fast instead of hanging the server |
 | `CAMBIUM_TEAM_BRANCH` | no | `cambium` | team-scope branch |
 | `CAMBIUM_AGENTSYNC_BRANCH` | no | `agentsync` | where distill reads coordination events |
 | `CAMBIUM_ORG_REPO` | no | — | path to the org knowledge repo clone (org scope off without it) |
@@ -110,8 +111,10 @@ work in it.
 
 ## Tools
 
-**`capture(content, type, kind, why, tags)`** — save a knowledge item to local
-scope (types: `memory` | `need` | `skill`). Manual path.
+**`capture(content, type, kind, why, tags, valid_while)`** — save a knowledge
+item to local scope (types: `memory` | `need` | `skill`). Manual path.
+`valid_while` optionally names the premise the item depends on, so a dead
+assumption is spottable later (see *Machine-maintained documentation entropy*).
 
 **`record_need(content, why, tags)`** — first-class needs ("we're missing X"),
 promotable like anything else so recurring wants surface at team/org level.
