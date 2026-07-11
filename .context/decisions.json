@@ -1,0 +1,29 @@
+[
+  {
+    "id": "dec-001-bb93",
+    "summary": "Ran cambium's first real end-to-end knowledge cycle on balatron history (distill -> recall -> promote to team -> endorse -> org PR -> cross-project recall). Federation validated: balatron-earned knowledge recalled from the Clark project.",
+    "problem": "Cambium had never been exercised on a real project's history end to end. We needed to prove the local->team->org promotion lifecycle and, critically, cross-project recall actually work before relying on cambium as the org knowledge layer.",
+    "why_chosen": "Drove cambium_server.py functions directly (the cambium MCP tools were not exposed in the session) with CAMBIUM_REPO=balatron, CAMBIUM_ORG_REPO=knowledge, org PR mode on. distill() produced 80 items (62 decisions + 18 constraints) entirely from context-keeper; agentsync contributed 0 (see companion constraint). Five standing recall queries, run to cross the recalls>=3 gate, promoted 22 items to the team cambium branch via the worktree+CAS path. con-016 (doc-sync) and con-014 (regime-boundary) were endorsed as universal practice and promoted to org as PRs #1/#2 (since merged). Pointing cambium at the Clark repo with the same org store, both items recalled back stamped project=balatron \u00e2\u20ac\u201d the pass condition for compound, cross-project knowledge growth.",
+    "what_we_tried": "A single pass of the five queries maxed at 2 recalls, so the queries were repeated across 3 rounds to represent recurring usage and cross the promotion gate of 3.",
+    "tradeoffs": "Two known frictions surfaced (recorded as constraints): cambium's lexical recall missed con-016 for the phrase 'documentation sync rule' (endorsement path used instead of recall), and parallel org PRs conflicted on knowledge.json.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [],
+    "tags": [
+      "cambium",
+      "knowledge-federation",
+      "distill",
+      "promote",
+      "first-cycle",
+      "cross-project"
+    ],
+    "retrieval_hints": [],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-10T17:22:21.500291+00:00",
+    "updated_at": "2026-07-10T17:22:21.500291+00:00",
+    "verified_at": "2026-07-10T17:22:21.500291+00:00"
+  }
+]

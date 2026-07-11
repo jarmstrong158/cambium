@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>cambium — LinkedIn card</title>
+<style>
+  :root {
+    --ink: #0e1116;
+    --panel: #161b22;
+    --panel-2: #1b222c;
+    --line: #242c37;
+    --line-soft: #1e2530;
+    --fg: #e6edf3;
+    --mut: #9aa7b8;
+    --mut-2: #6a7688;
+    --as: #4cc9f0;
+    --ck: #e8b84b;
+    --cb: #5bd18b;
+    --as-dim: #16303c;
+    --ck-dim: #33301b;
+    --cb-dim: #163022;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    background: #05070a;
+    min-height: 100%;
+    display: flex; align-items: flex-start; justify-content: center;
+    padding: 24px;
+    font-family: var(--sans);
+  }
+
+  /* 1080 x 1350 — LinkedIn portrait. Screenshot this box. */
+  .card {
+    width: 1080px; height: 1350px;
+    flex: none;
+    background:
+      radial-gradient(1200px 620px at 82% -8%, #12222d 0%, rgba(18,34,45,0) 58%),
+      radial-gradient(1000px 640px at -10% 112%, #14271e 0%, rgba(20,39,30,0) 55%),
+      var(--ink);
+    color: var(--fg);
+    padding: 84px 80px 72px;
+    display: flex; flex-direction: column;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 22px; letter-spacing: .22em; text-transform: uppercase;
+    color: var(--mut-2);
+  }
+
+  h1 {
+    font-family: var(--mono);
+    font-weight: 600;
+    font-size: 68px; line-height: 1.08; letter-spacing: -.015em;
+    margin: 26px 0 0; text-wrap: balance;
+  }
+  h1 .grow { color: var(--cb); }
+
+  .lede {
+    font-size: 27px; line-height: 1.5; color: var(--mut);
+    max-width: 30ch; margin: 28px 0 0;
+  }
+  .lede b { color: var(--fg); font-weight: 600; }
+
+  /* three tenses */
+  .tenses { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; margin-top: 48px; }
+  .tense {
+    border: 1px solid var(--line);
+    border-top: 3px solid var(--tc);
+    border-radius: 14px;
+    background: linear-gradient(180deg, var(--tcd), transparent 66%);
+    padding: 22px 22px 24px;
+  }
+  .tense .tag {
+    font-family: var(--mono); font-size: 16px; letter-spacing: .16em;
+    text-transform: uppercase; color: var(--mut-2); display: block; margin-bottom: 12px;
+  }
+  .tense .who { font-family: var(--mono); font-size: 27px; font-weight: 600; color: var(--tc); }
+  .tense .what { font-size: 20px; line-height: 1.42; color: var(--mut); margin-top: 10px; }
+  .tense.as { --tc: var(--as); --tcd: var(--as-dim); }
+  .tense.ck { --tc: var(--ck); --tcd: var(--ck-dim); }
+  .tense.cb { --tc: var(--cb); --tcd: var(--cb-dim); }
+
+  /* the loop */
+  .looptitle {
+    font-family: var(--mono); font-size: 18px; letter-spacing: .18em;
+    text-transform: uppercase; color: var(--mut-2); margin: 52px 0 20px;
+  }
+  .loop { display: flex; align-items: stretch; gap: 0; }
+  .step {
+    flex: 1;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: var(--panel);
+    padding: 22px 20px;
+    display: flex; flex-direction: column; gap: 8px;
+    position: relative;
+  }
+  .step .n { font-family: var(--mono); font-size: 16px; color: var(--cb); letter-spacing: .1em; }
+  .step .t { font-family: var(--mono); font-size: 24px; font-weight: 600; color: var(--fg); }
+  .step .d { font-size: 18px; color: var(--mut); line-height: 1.36; }
+  .conn {
+    flex: none; width: 34px;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--cb); font-family: var(--mono); font-size: 26px;
+  }
+
+  /* scope bar */
+  .scope { display: flex; align-items: center; gap: 14px; margin-top: 26px; }
+  .scope .chip {
+    font-family: var(--mono); font-size: 20px; color: var(--cb);
+    border: 1px solid #2b6a45; border-radius: 999px; padding: 9px 20px;
+    background: rgba(91,209,139,.09);
+  }
+  .scope .chip.dim { color: var(--mut); border-color: var(--line); background: transparent; }
+  .scope .g { color: var(--mut-2); font-family: var(--mono); font-size: 22px; }
+
+  footer {
+    margin-top: auto;
+    display: flex; align-items: flex-end; justify-content: space-between; gap: 24px;
+    padding-top: 40px; border-top: 1px solid var(--line);
+  }
+  footer .bytes { font-family: var(--mono); font-size: 19px; color: var(--mut); }
+  footer .bytes b { color: var(--cb); font-weight: 600; }
+  .repos { display: flex; gap: 10px; }
+  .repo {
+    font-family: var(--mono); font-size: 18px; color: var(--fg);
+    border: 1px solid var(--line); border-radius: 999px; padding: 8px 15px;
+  }
+  .repo::before { content: "◆ "; color: var(--rc); }
+  .repo.as { --rc: var(--as); }
+  .repo.ck { --rc: var(--ck); }
+  .repo.cb { --rc: var(--cb); }
+
+  .hint {
+    position: fixed; top: 8px; left: 50%; transform: translateX(-50%);
+    font-family: var(--mono); font-size: 12px; color: #55627a;
+  }
+  @media print { .hint { display: none; } body { padding: 0; background: #fff; } }
+</style>
+</head>
+<body>
+  <div class="hint">↓ screenshot the card below (1080×1350) · this line won't appear in print/PDF</div>
+
+  <div class="card">
+    <span class="eyebrow">agentsync · context-keeper · cambium</span>
+    <h1>Three MCPs. One loop.<br><span class="grow">Knowledge that compounds itself.</span></h1>
+    <p class="lede">Every AI knowledge layer I tried failed the same way: it was a <b>side system nobody's agent ever called</b>. So I stopped building a system and built three small MCPs that live where the work already is — git.</p>
+
+    <div class="tenses">
+      <div class="tense as">
+        <span class="tag">present tense</span>
+        <div class="who">agentsync</div>
+        <div class="what">Who's touching what right now, so two agents don't collide.</div>
+      </div>
+      <div class="tense ck">
+        <span class="tag">past tense</span>
+        <div class="who">context-keeper</div>
+        <div class="what">Why each decision was made, kept per project.</div>
+      </div>
+      <div class="tense cb">
+        <span class="tag">future tense</span>
+        <div class="who">cambium</div>
+        <div class="what">What everyone should carry forward — fed by the other two.</div>
+      </div>
+    </div>
+
+    <div class="looptitle">the loop — no wiki, no database</div>
+    <div class="loop">
+      <div class="step"><span class="n">01</span><span class="t">work</span><span class="d">agents build &amp; coordinate; each task leaves a trail</span></div>
+      <div class="conn">→</div>
+      <div class="step"><span class="n">02</span><span class="t">distill</span><span class="d">a hook turns the trail into memory</span></div>
+      <div class="conn">→</div>
+      <div class="step"><span class="n">03</span><span class="t">recall</span><span class="d">any agent type asks one endpoint</span></div>
+      <div class="conn">→</div>
+      <div class="step"><span class="n">04</span><span class="t">promote</span><span class="d">it climbs scopes as it earns trust</span></div>
+    </div>
+
+    <div class="scope">
+      <span class="chip dim">local</span>
+      <span class="g">→ recalls / endorse →</span>
+      <span class="chip dim">team</span>
+      <span class="g">→ endorse + merged PR →</span>
+      <span class="chip">org</span>
+    </div>
+
+    <footer>
+      <div class="bytes">All git, all JSON. <b>No database, no server to babysit.</b><br>An agent only ever calls recall() — it never knows which file answered.</div>
+      <div class="repos">
+        <span class="repo as">agentsync</span>
+        <span class="repo ck">context-keeper</span>
+        <span class="repo cb">cambium</span>
+      </div>
+    </footer>
+  </div>
+</body>
+</html>

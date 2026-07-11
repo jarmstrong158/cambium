@@ -1,0 +1,51 @@
+[
+  {
+    "id": "con-001-491f",
+    "rule": "To distill agentsync outcomes for a project, that project's OWN origin must carry the agentsync coordination branch. distill() reads origin/<agentsync_branch> of CAMBIUM_REPO only \u00e2\u20ac\u201d it will not reach a board hosted on a different repo, and released claims are never reconstructed from history.",
+    "reason": "In balatron's first cycle distill() returned 0 agentsync items and reported 'no coordination branch found', because balatron's origin has no agentsync branch \u00e2\u20ac\u201d the team's live board lives on agentsync-remote/aethermoor, and all of balatron's claims had already been released. Cambium silently falls back to context-keeper only, so you lose every agentsync outcome-memory without any error. Verify the branch exists (git ls-remote --heads origin agentsync) before trusting a distill's agentsync count.",
+    "triggering_incident": "balatron distill on 2026-07-10: sources.agentsync = 'no coordination branch found'; 80/80 items came from context-keeper, 0 from agentsync.",
+    "scope": "global",
+    "hardness": "advisory",
+    "related_to": [
+      "dec-001-bb93"
+    ],
+    "tags": [
+      "cambium",
+      "agentsync",
+      "distill",
+      "wiring"
+    ],
+    "retrieval_hints": [],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-07-10T17:22:31.814868+00:00",
+    "updated_at": "2026-07-10T17:22:31.814868+00:00",
+    "verified_at": "2026-07-10T17:22:31.814868+00:00"
+  },
+  {
+    "id": "con-002-3860",
+    "rule": "In PR-mode org promotion, promote items to org ONE AT A TIME \u00e2\u20ac\u201d merge each cambium promotion PR before opening the next. Do not open multiple org promotion PRs against knowledge.json concurrently.",
+    "reason": "Each promote(item_id, to_scope='org') branches off origin/main and appends to the same knowledge.json items array. Two concurrently-open promotion PRs edit the same region of that array, so the second cannot merge cleanly until the first lands \u00e2\u20ac\u201d this is the documented non-transactional PR-mode limitation. Serializing (open PR, merge, then promote the next) avoids the conflict entirely.",
+    "triggering_incident": "knowledge PRs #1 (con-016) and #2 (con-014) were opened back-to-back on 2026-07-10; PR #2 required manual conflict resolution against knowledge.json before it could merge.",
+    "scope": "global",
+    "hardness": "advisory",
+    "related_to": [
+      "dec-001-bb93"
+    ],
+    "tags": [
+      "cambium",
+      "promote",
+      "org",
+      "pull-request",
+      "conflict"
+    ],
+    "retrieval_hints": [],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-07-10T17:22:39.408490+00:00",
+    "updated_at": "2026-07-10T17:22:39.408490+00:00",
+    "verified_at": "2026-07-10T17:22:39.408490+00:00"
+  }
+]

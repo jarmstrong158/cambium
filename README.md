@@ -336,6 +336,21 @@ seam), and a **real MCP stdio transport test**. CI runs it on every push.
   org items have already finished climbing.
 - **PR-mode promotion isn't transactional** — the team copy stays (annotated
   with the PR URL) until a human merges. That's the point: review is the gate.
+  A direct consequence: **promote to org one item at a time in PR mode.** Every
+  `promote(item_id, to_scope="org")` branches off `origin/main` and appends to
+  the same `items` array in `knowledge.json`, so two concurrently-open promotion
+  PRs edit the same region of that file and the second can't merge cleanly until
+  the first lands. (Observed: two knowledge PRs opened back-to-back on
+  2026-07-10; the second needed manual conflict resolution against
+  `knowledge.json`.) Open a PR, merge it, *then* promote the next — serializing
+  avoids the conflict entirely.
+- **Distill's agentsync substrate is the project repo's own `agentsync`
+  branch**, not remote or cross-repo boards. `distill()` `git fetch`es
+  `claims.json` from `<CAMBIUM_REMOTE>/<CAMBIUM_AGENTSYNC_BRANCH>` of the single
+  configured `CAMBIUM_REPO` — it reads *that* repo's coordination branch through
+  git. Work coordinated on a different repo's board, or through the
+  agentsync-remote transport against a different backing store, is invisible to
+  it; point cambium at each repo whose coordination you want distilled.
 - **Distill captures at the moments it runs, not exhaustively.** By default it
   imports agentsync's *currently* done claims; a claim released or re-claimed
   before any distill catches it live is lost. `CAMBIUM_RELEASE_CAPTURE=1` closes
