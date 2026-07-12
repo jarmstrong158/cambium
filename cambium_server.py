@@ -624,6 +624,10 @@ def _render_markdown(items, title="Knowledge"):
 
     for scope in sorted(by_scope, key=lambda s: (_SCOPE_ORDER.get(s, 9), s)):
         lines += [f"## {scope} scope", ""]
+        if scope == "org":
+            lines += ["_Project headings below mark where each item was learned "
+                      "(its provenance); org-scope knowledge applies across "
+                      "projects, not only to its origin._", ""]
         projects = by_scope[scope]
         for project in sorted(projects):
             lines += [f"### {project}", ""]
@@ -681,16 +685,24 @@ VALID_TYPES = ("memory", "need", "skill")
 
 
 def _new_item(cfg, content, type_, kind, why, tags, source):
+    # Normalize cp1252 mojibake at the single write chokepoint every source
+    # (distill, import, manual capture) routes through, so the canonical store
+    # — and therefore recall() — is clean, not just the markdown export. A
+    # substrate that fed us mangled em-dashes (context-keeper .context/, an
+    # import export, an agentsync note) is repaired once, on the way in.
+    src = dict(source or {})
+    if src.get("ref"):
+        src["ref"] = _demojibake(src["ref"])
     return {
         "id": f"k-{uuid.uuid4().hex[:8]}",
         "type": type_,
         "kind": kind,
-        "content": content,
-        "why": why,
-        "tags": tags,
+        "content": _demojibake(content),
+        "why": _demojibake(why),
+        "tags": [_demojibake(t) for t in tags],
         "scope": "local",
         "project": cfg["project"],
-        "source": source,
+        "source": src,
         "created_by": cfg["agent"],
         "created_at": _now(),
         "updated_at": _now(),
@@ -1035,7 +1047,7 @@ def capture(content: str, type: str = "memory", kind: str = "note",
     item = _new_item(cfg, content.strip(), type, kind, why.strip(),
                      _parse_tags(tags), {"system": "manual", "ref": ""})
     if valid_while.strip():
-        item["valid_while"] = valid_while.strip()
+        item["valid_while"] = _demojibake(valid_while.strip())
     data["items"].append(item)
     _write_local(cfg, data)
     return json.dumps({"status": "captured", "item": item}, indent=2)

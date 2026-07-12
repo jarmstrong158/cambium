@@ -300,10 +300,13 @@ never an automatic downgrade. cambium reports the smell; a person decides.
 python3 test_cambium.py
 ```
 
-51 cases against real git repos: **markdown export** (`KNOWLEDGE.md` grouped by
+52 cases against real git repos: **markdown export** (`KNOWLEDGE.md` grouped by
 scope then project with provenance/recalls/promoted-date, cp1252 mojibake
 normalized, auto-written alongside `knowledge.json` on org promotion in both
-direct-push and PR modes), **onboarding** (unconfigured `status()` reports
+direct-push and PR modes), **write-time normalization** (a substrate that feeds
+distill a cp1252-mangled em-dash lands clean in the canonical store, so
+`recall()` serves repaired text, not just the rendered `.md`), **onboarding**
+(unconfigured `status()` reports
 gaps with costs and fixes, every tool fails helpful when unconfigured, `setup()`
 configures from a cold start and its config takes effect in-process, env
 overrides the file, org names are offered as `gh` commands not created, non-git

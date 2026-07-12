@@ -302,6 +302,45 @@ def test_distill_reports_missing_substrates():
         assert "no .context" in r["sources"]["context_keeper"], r
 
 
+def test_distill_normalizes_cp1252_mojibake_on_write():
+    # A substrate that fed us a cp1252-mangled em-dash (UTF-8 bytes E2 80 94
+    # decoded as Windows-1252 -> "â€”") must land CLEAN in the
+    # canonical store, so recall() serves clean text — not merely the markdown
+    # export. Guards against the store/KNOWLEDGE.md divergence that put "â
+    # €”" into the org knowledge.json while the .md rendered fine.
+    mojibake = "â€”"        # em-dash gone through cp1252
+    clean = "—"                        # the em-dash it must become
+    with lab() as (root, origin, clones):
+        ctx = os.path.join(clones["jonny"], ".context")
+        os.makedirs(ctx, exist_ok=True)
+        constraints = [{
+            "id": "con-mojibake", "schema_version": 1,
+            "rule": f"Verify with git merge-tree {mojibake} do not trust an "
+                    f"empty files[] list as a real conflict",
+            "reason": f"a missing ref {mojibake} returns a misleading conflict",
+            "hardness": "absolute", "scope": "coord", "tags": ["agentsync"],
+            "related_to": [], "triggering_incident": "",
+            "status": "active",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "updated_at": "2026-06-01T00:00:00+00:00",
+            "verified_at": "2026-06-01T00:00:00+00:00",
+        }]
+        with open(os.path.join(ctx, "constraints.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(constraints, f, indent=2)
+        be(clones, "jonny")
+        M.distill()
+        stored = M._read_local(M._cfg())["items"][0]
+        assert mojibake not in stored["content"], stored["content"]
+        assert clean in stored["content"], stored["content"]
+        assert mojibake not in stored["why"], stored["why"]
+        assert clean in stored["why"], stored["why"]
+        # and recall returns the repaired text, not the mangled bytes
+        rec = json.loads(M.recall("git merge-tree empty files conflict"))
+        assert rec["results"], rec
+        assert mojibake not in rec["results"][0]["content"], rec
+
+
 # --------------------------------------------------------------------------- #
 # release-time capture (opt-in) — capture a claim at its done/released
 # transition, before agentsync churns it out of live state
@@ -1290,6 +1329,7 @@ TESTS = [
     test_distill_from_context_keeper,
     test_distill_is_idempotent,
     test_distill_reports_missing_substrates,
+    test_distill_normalizes_cp1252_mojibake_on_write,
     test_release_capture_is_off_by_default,
     test_release_capture_survives_reclaim_churn,
     test_release_capture_grabs_noted_claim_a_full_distill_would_miss,
