@@ -151,6 +151,8 @@ def _config_source(name, file_cfg):
         return "env"
     if file_cfg.get(name) not in (None, ""):
         return "config-file"
+    if name == "CAMBIUM_REPO" and _git_root():
+        return "cwd"          # resolved from the current project, not a gap
     return "unset"
 
 
@@ -158,12 +160,30 @@ def _abspath(p):
     return os.path.abspath(os.path.expanduser(p)) if p else ""
 
 
+def _git_root(start=None):
+    """The git working-tree root at or above `start` (default: cwd), or "".
+    Lets a solo operator who IS the org configure once (org_repo + agent_id) and
+    have cambium operate on whichever project the session is in — CAMBIUM_REPO
+    defaults to the current repo instead of being pinned to a single project."""
+    d = _abspath(start or os.getcwd())
+    while d:
+        if os.path.isdir(os.path.join(d, ".git")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return ""
+        d = parent
+    return ""
+
+
 def _cfg():
     """Resolved config dict, or ConfigError if a required setting is missing or
     the repo isn't a git clone. Tools call this via _require_cfg() so the error
     becomes helpful guidance instead of a raised exception."""
     file_cfg = _load_config_file()
-    repo = _resolve("CAMBIUM_REPO", file_cfg)
+    # CAMBIUM_REPO falls back to the current repo (cwd's git root) when unset, so
+    # one org_repo + agent_id config serves every project the operator works in.
+    repo = _resolve("CAMBIUM_REPO", file_cfg) or _git_root()
     agent = _resolve("CAMBIUM_AGENT_ID", file_cfg)
     if not repo or not agent:
         missing = [n for n, v in (("CAMBIUM_REPO", repo),
@@ -199,7 +219,7 @@ def _config_state():
     Powers status() and the fail-helpful path so any agent that touches an
     unconfigured cambium can offer setup conversationally from the response."""
     file_cfg = _load_config_file()
-    repo = _resolve("CAMBIUM_REPO", file_cfg)
+    repo = _resolve("CAMBIUM_REPO", file_cfg) or _git_root()
     agent = _resolve("CAMBIUM_AGENT_ID", file_cfg)
     org = _resolve("CAMBIUM_ORG_REPO", file_cfg, "")
     repo_is_git = bool(repo) and os.path.isdir(os.path.join(_abspath(repo), ".git"))
