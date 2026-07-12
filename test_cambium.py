@@ -820,6 +820,112 @@ def test_promote_team_to_org_requires_endorsement():
         assert rec["results"] and rec["results"][0]["scope"] == "org", rec
 
 
+# --------------------------------------------------------------------------- #
+# org generalization gate — a project-specific body cannot silently acquire
+# org-wide readership; it must be restated (or forced) at the boundary.
+# --------------------------------------------------------------------------- #
+def _seed_team_endorsed(clones, org_clone, content, note):
+    """Capture -> team -> endorse, returning the item_id ready for org promotion."""
+    be(clones, "jonny", CAMBIUM_ORG_REPO=org_clone, CAMBIUM_PROMOTE_RECALLS="1")
+    item_id = json.loads(M.capture(content, tags="x"))["item"]["id"]
+    M.recall(content[:30])
+    M.promote()
+    M.endorse(item_id, note=note)
+    return item_id
+
+
+def test_org_promotion_blocks_project_specific_body():
+    with lab() as (root, origin, clones):
+        _, org_clone = setup_org_repo(root)
+        item_id = _seed_team_endorsed(
+            clones, org_clone,
+            "Append every regime boundary to dashboard.py REGIMES so trend "
+            "lines are never misread across a discontinuity",
+            "Universal metrics practice: annotate a regime boundary whenever a "
+            "metric's computation changes")
+        r = json.loads(M.promote(item_id=item_id, to_scope="org"))
+        assert r["status"] == "not_generalized", r
+        assert any("dashboard.py" in s for s in r["project_local_signals"]), r
+        assert "regime boundary" in (r["suggested_org_statement"] or ""), r
+        # nothing crossed into org
+        assert all(i["id"] != item_id for i in M._read_org(M._cfg())), "leaked"
+
+
+def test_org_promotion_with_org_content_generalizes_and_preserves_example():
+    with lab() as (root, origin, clones):
+        _, org_clone = setup_org_repo(root)
+        specific = ("Append every regime boundary to dashboard.py REGIMES so "
+                    "trends are never misread across a discontinuity")
+        item_id = _seed_team_endorsed(clones, org_clone, specific,
+                                      "annotate regime boundaries")
+        general = ("Annotate a regime boundary whenever a metric's computation "
+                   "or accounting changes, so trends are not misread across it")
+        r = json.loads(M.promote(item_id=item_id, to_scope="org",
+                                 org_content=general))
+        assert r["status"] == "promoted", r
+        assert r["item"]["content"] == general, r
+        assert r["item"]["example"] == specific, r     # concrete kept
+        # a collaborator recalls the GENERAL rule at org scope; concrete = example
+        be(clones, "stobie", CAMBIUM_ORG_REPO=org_clone)
+        rec = json.loads(M.recall("metric computation changed trend", scope="org"))
+        top = rec["results"][0]
+        assert top["content"] == general, rec
+        assert "dashboard.py" in top["example"], rec
+
+
+def test_org_promotion_force_ships_specific_body():
+    with lab() as (root, origin, clones):
+        _, org_clone = setup_org_repo(root)
+        item_id = _seed_team_endorsed(
+            clones, org_clone,
+            "Back up the checkpoint as clark_foundation.pt.bak first",
+            "training safety")
+        r = json.loads(M.promote(item_id=item_id, to_scope="org", force=True))
+        assert r["status"] == "promoted", r
+        assert "clark_foundation" in r["item"]["content"], r
+        assert "example" not in r["item"], r           # forced, not restated
+
+
+def test_org_promotion_allows_clean_universal_body():
+    with lab() as (root, origin, clones):
+        _, org_clone = setup_org_repo(root)
+        item_id = _seed_team_endorsed(
+            clones, org_clone,
+            "Every subprocess or network call must have an explicit timeout",
+            "universal reliability")
+        r = json.loads(M.promote(item_id=item_id, to_scope="org"))
+        assert r["status"] == "promoted", r            # gate must not over-block
+
+
+def test_recall_surfaces_endorsed_as():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        item_id = json.loads(M.capture("Keep hook print() output ASCII-only",
+                                       tags="hooks"))["item"]["id"]
+        M.endorse(item_id, note="universal Windows cp1252 hazard")
+        rec = json.loads(M.recall("hook ascii output"))
+        assert rec["results"][0]["endorsed_as"] == \
+            ["universal Windows cp1252 hazard"], rec
+
+
+def test_review_promotions_flags_org_needs_generalization():
+    with lab() as (root, origin, clones):
+        _, org_clone = setup_org_repo(root)
+        item_id = _seed_team_endorsed(
+            clones, org_clone,
+            "Mirror each decision into DECISIONS.md in the same commit",
+            "keep machine + human logs in lockstep")
+        # force a specific body into org (as pre-gate promotions did), then the
+        # tool self-diagnoses it as needing generalization
+        M.promote(item_id=item_id, to_scope="org", force=True)
+        rv = json.loads(M.review_promotions())
+        row = next((x for x in rv["org_needs_generalization"]
+                    if x["id"] == item_id), None)
+        assert row, rv
+        assert any("DECISIONS.md" in s for s in row["project_local_signals"]), row
+        assert "lockstep" in (row["suggested_org_statement"] or ""), row
+
+
 def test_promote_to_org_via_pull_request():
     with lab() as (root, origin, clones):
         org_bare, org_clone = setup_org_repo(root)
@@ -997,8 +1103,13 @@ def test_full_compound_growth_loop():
         team = M._read_team(M._cfg())
         item_id = next(i["id"] for i in team if "argon2id" in i["content"])
         M.endorse(item_id, note="canonical auth interface")
-        r = json.loads(M.promote(item_id=item_id, to_scope="org"))
+        # the distilled body names auth.py/routes.py, so org promotion requires
+        # the cross-project restatement (the generalization gate).
+        r = json.loads(M.promote(item_id=item_id, to_scope="org",
+                                 org_content="Auth hashes passwords with "
+                                 "argon2id and the login route returns a JWT"))
         assert r["status"] == "promoted", r
+        assert "auth.py" in r["item"]["example"], r  # concrete body preserved
         # a different collaborator, org-configured, recalls it at org scope
         be(clones, "stobie", CAMBIUM_ORG_REPO=org_clone)
         rec = json.loads(M.recall("how does auth hash passwords with argon2",
@@ -1353,6 +1464,12 @@ TESTS = [
     test_promote_explicit_id_respects_threshold_and_force,
     test_team_recall_tracks_cross_project_usage,
     test_promote_team_to_org_requires_endorsement,
+    test_org_promotion_blocks_project_specific_body,
+    test_org_promotion_with_org_content_generalizes_and_preserves_example,
+    test_org_promotion_force_ships_specific_body,
+    test_org_promotion_allows_clean_universal_body,
+    test_recall_surfaces_endorsed_as,
+    test_review_promotions_flags_org_needs_generalization,
     test_promote_to_org_via_pull_request,
     test_review_promotions_lists_eligible,
     test_export_markdown_publishes_grouped_with_provenance,

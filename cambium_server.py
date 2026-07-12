@@ -55,6 +55,7 @@ Config (environment, set in the MCP client config)
 import hashlib
 import json
 import os
+import re
 import subprocess
 import time
 import uuid
@@ -757,6 +758,67 @@ def _eligible_org(item):
 
 
 # --------------------------------------------------------------------------- #
+# org-scope framing — a body that is right in ONE repo is not automatically
+# right for EVERY repo. Promotion to org is a change of readership (everyone),
+# so a project-specific runbook ("append to dashboard.py REGIMES", "back up as
+# clark_foundation.pt") must be restated as the cross-project rule before it
+# crosses. cambium does not rewrite prose (it is deterministic, model-free); it
+# DETECTS the smell and makes the human resolve it at the boundary, exactly as
+# the endorsement gate already does. The generalization usually already exists,
+# in the endorsement note — offered back as a ready draft.
+# --------------------------------------------------------------------------- #
+# A concrete filename is the reliable "this is one repo's runbook" signal. We
+# deliberately do NOT match bare word/word "paths": prose uses slashes for
+# lists ("survey/claim/update_status", "read/write"), and every real path of
+# concern in practice ends in a filename this already catches.
+_FILE_TELL = re.compile(
+    r"\b[\w-]+\.(?:py|md|json|gd|tscn|ts|js|jsx|tsx|sh|toml|ya?ml|cfg|ini|txt"
+    r"|rs|go|c|cpp|h|pt|ckpt|sql)\b")
+_TEST_TELL = re.compile(r"\b(?:test_[a-z]\w+|Test[A-Z]\w+)\b")
+_PROV_TELL = re.compile(r"\b(?:dec|con)-\d+\b")       # a real provenance ref
+
+
+def _org_body_smells_local(item):
+    """Deterministic lint: does this item's BODY read like a single-repo runbook
+    rather than a cross-project rule? Returns the list of concrete tells found
+    (empty == looks org-ready). Used to gate team->org promotion so a specific
+    body cannot silently acquire org-wide blast radius — the human either
+    restates it (org_content=) or overrides (force=True)."""
+    content = item.get("content", "") or ""
+    tells = []
+    project = (item.get("project") or "").strip()
+    # 1. the origin project's name appearing in the body (underscores count as
+    #    a boundary so "clark_foundation" trips on project "clark", but
+    #    "start" does not trip on "art").
+    if len(project) >= 4:
+        if re.search(r"(?<![a-z0-9])" + re.escape(project) + r"(?![a-z0-9])",
+                     content, re.IGNORECASE):
+            tells.append(f"names its origin project ('{project}')")
+    # 2. a concrete filename, 3. a test id, 4. a provenance ref
+    for m in _FILE_TELL.findall(content):
+        tells.append(f"names a file ('{m}')")
+    for m in _TEST_TELL.findall(content):
+        tells.append(f"names a test ('{m}')")
+    for m in _PROV_TELL.findall(content):
+        tells.append(f"cites a provenance ref ('{m}')")
+    # de-dup, preserve order
+    seen, out = set(), []
+    for t in tells:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _endorsement_notes(item):
+    """The non-empty endorsement notes on an item, newest last — where the
+    cross-project restatement usually already lives."""
+    return [e.get("note", "").strip()
+            for e in item.get("trust", {}).get("endorsements", [])
+            if e.get("note", "").strip()]
+
+
+# --------------------------------------------------------------------------- #
 # post-promotion staleness — verification events + premise linkage.
 #
 # Trust-gated promotion defends knowledge on the way IN; nothing marked a
@@ -1331,8 +1393,13 @@ def recall(query: str, scope: str = "auto", limit: int = 5) -> str:
 
     results = [
         {"scope": s, "relevance": round(sc, 3), **{
-            k: i[k] for k in ("id", "type", "kind", "content", "why", "tags",
-                              "project", "trust", "source") if k in i}}
+            k: i[k] for k in ("id", "type", "kind", "content", "example", "why",
+                              "tags", "project", "trust", "source") if k in i},
+         # Surface the endorsement notes as first-class context: for an item
+         # promoted from one project, this is where its cross-project meaning
+         # was written — not buried in the trust blob.
+         **({"endorsed_as": _endorsement_notes(i)} if _endorsement_notes(i)
+            else {})}
         for s, sc, i in top
     ]
     out = {
@@ -1425,7 +1492,8 @@ def verify_entry(item_id: str, note: str = "") -> str:
 
 
 @mcp.tool()
-def promote(item_id: str = "", to_scope: str = "", force: bool = False) -> str:
+def promote(item_id: str = "", to_scope: str = "", force: bool = False,
+            org_content: str = "") -> str:
     """Graduate knowledge up a scope as it earns trust — the compound-growth
     step. With no arguments, scans your local items and promotes every one
     that qualifies to team. With an item_id, promotes that item one level
@@ -1434,7 +1502,16 @@ def promote(item_id: str = "", to_scope: str = "", force: bool = False) -> str:
     Thresholds: local->team needs recalls >= CAMBIUM_PROMOTE_RECALLS or one
     endorsement; team->org always needs an endorsement (force=True overrides,
     use deliberately). Org promotion lands as a direct push, or as a pull
-    request when CAMBIUM_ORG_PR=1 — the PR review is the org trust gate."""
+    request when CAMBIUM_ORG_PR=1 — the PR review is the org trust gate.
+
+    org_content : the cross-project restatement of a body that is specific to
+    one repo. Promotion to org changes the readership to everyone, so a
+    project-local runbook ("append to dashboard.py REGIMES") must become the
+    general rule ("annotate a regime boundary when a metric's computation
+    changes"). If the body reads project-specific and no org_content is given,
+    promotion is refused (with the tells and a suggested draft) unless
+    force=True. When supplied, org_content becomes the org body and the original
+    is preserved as `example`."""
     cfg, err = _require_cfg()
     if err:
         return err
@@ -1456,6 +1533,25 @@ def promote(item_id: str = "", to_scope: str = "", force: bool = False) -> str:
             })
         item = dict(src)
         stamped = _now()
+        # Generalization gate: org is a wider readership than any one repo, so a
+        # project-specific body must be restated before it crosses (or forced).
+        if org_content.strip():
+            item["example"] = item["content"]  # keep the concrete runbook
+            item["content"] = _demojibake(org_content.strip())
+        elif not force:
+            tells = _org_body_smells_local(item)
+            if tells:
+                notes = _endorsement_notes(item)
+                return json.dumps({
+                    "status": "not_generalized",
+                    "message": "This body reads project-specific, but org scope "
+                               "is read by every project. Restate it as the "
+                               "cross-project rule via org_content=\"...\" (the "
+                               "concrete version is kept as `example`), or "
+                               "force=True to promote as-is.",
+                    "project_local_signals": tells,
+                    "suggested_org_statement": notes[-1] if notes else None,
+                }, indent=2)
         item["scope"] = "org"
         item["updated_at"] = stamped
         item["last_verified"] = stamped  # promotion IS a verification
@@ -1548,6 +1644,23 @@ def review_promotions() -> str:
                 "recalls": t.get("recalls", 0),
                 "endorsements": len(t.get("endorsements", [])),
                 "projects": t.get("projects", [])}
+    # Self-diagnosis: org items whose body still reads like a single-repo
+    # runbook. These crossed before the generalization gate existed (or were
+    # forced); each should be restated as the cross-project rule.
+    org_smells = []
+    if cfg["org_repo"]:
+        for i in _read_org(cfg):
+            if i.get("status", "active") != "active":
+                continue
+            tells = _org_body_smells_local(i)
+            if tells:
+                notes = _endorsement_notes(i)
+                org_smells.append({
+                    "id": i["id"], "project": i.get("project"),
+                    "content": i["content"][:100],
+                    "project_local_signals": tells,
+                    "suggested_org_statement": notes[-1] if notes else None,
+                })
     return json.dumps(
         {
             "threshold": {"team_recalls": cfg["promote_recalls"],
@@ -1561,6 +1674,7 @@ def review_promotions() -> str:
                                  and "promotion" not in i],
             "org_prs_pending": [{"id": i["id"], "pr": i["promotion"]["pr"]}
                                 for i in team if i.get("promotion")],
+            "org_needs_generalization": org_smells,
             "org_configured": bool(cfg["org_repo"]),
         },
         indent=2,
