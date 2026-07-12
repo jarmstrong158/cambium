@@ -1341,14 +1341,19 @@ def test_real_agentsync_release_capture():
 def test_status_reports_gaps_when_unconfigured():
     with lab() as (root, origin, clones):
         unconfigured(root)
-        s = json.loads(M.status())  # must not raise
-        assert s["configured"] is False, s
-        settings = {g["setting"] for g in s["gaps"]}
-        assert {"CAMBIUM_REPO", "CAMBIUM_AGENT_ID"} <= settings, s
-        # every gap states a plain-terms cost and the exact setup() fix
-        assert all(g.get("cost") and "setup(" in g.get("fix", "")
-                   for g in s["gaps"]), s
-        assert "setup(" in s["next_step"], s
+        prev = os.getcwd()
+        try:
+            os.chdir(root)  # outside any git repo, so CAMBIUM_REPO is a true gap
+            s = json.loads(M.status())  # must not raise
+            assert s["configured"] is False, s
+            settings = {g["setting"] for g in s["gaps"]}
+            assert {"CAMBIUM_REPO", "CAMBIUM_AGENT_ID"} <= settings, s
+            # every gap states a plain-terms cost and the exact setup() fix
+            assert all(g.get("cost") and "setup(" in g.get("fix", "")
+                       for g in s["gaps"]), s
+            assert "setup(" in s["next_step"], s
+        finally:
+            os.chdir(prev)
 
 
 def test_every_tool_fails_helpful_when_unconfigured():
@@ -1373,6 +1378,32 @@ def test_every_tool_fails_helpful_when_unconfigured():
             assert r.get("configured") is False, f"{name}: {r}"
             assert r.get("needs_setup") is True, f"{name}: {r}"
             assert "setup(" in r.get("next_step", ""), f"{name}: {r}"
+
+
+def test_cfg_defaults_repo_to_cwd_git_root():
+    """Solo-operator model: with org_repo+agent_id configured and CAMBIUM_REPO
+    unset, cambium operates on whatever project the session is in (cwd's git
+    root), so one config serves every project."""
+    with lab() as (root, origin, clones):
+        for k in CAMBIUM_ENV:
+            os.environ.pop(k, None)
+        os.environ["CAMBIUM_AGENT_ID"] = "jonny"
+        os.environ["CAMBIUM_CONFIG_FILE"] = os.path.join(root, "no_config.json")
+        assert "CAMBIUM_REPO" not in os.environ
+        prev = os.getcwd()
+        try:
+            sub = os.path.join(clones["jonny"], "deep", "nested")
+            os.makedirs(sub, exist_ok=True)
+            os.chdir(sub)                       # a nested dir of the project
+            cfg = M._cfg()
+            assert os.path.samefile(cfg["repo"], clones["jonny"]), cfg["repo"]
+            assert cfg["project"] == os.path.basename(
+                clones["jonny"].rstrip("/\\")), cfg
+            # status() reports configured off the cwd default too
+            os.environ["CAMBIUM_ORG_REPO"] = clones["stobie"]
+            assert json.loads(M.status())["configured"] is True
+        finally:
+            os.chdir(prev)
 
 
 def test_setup_configures_from_cold_start():
@@ -1565,6 +1596,7 @@ TESTS = [
     test_status_overview,
     test_status_reports_gaps_when_unconfigured,
     test_every_tool_fails_helpful_when_unconfigured,
+    test_cfg_defaults_repo_to_cwd_git_root,
     test_setup_configures_from_cold_start,
     test_setup_env_overrides_config_file,
     test_setup_offers_org_commands_without_creating,
