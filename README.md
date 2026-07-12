@@ -173,6 +173,15 @@ cross-project rule via `org_content=` (the concrete body is kept as `example`)
 or `force=True` to override. The refusal hands back the endorsement note as a
 ready draft. Mirrors the endorsement gate; the safe path is the easy path.
 
+**`generalize(item_id, org_content, note)`** — the remediation counterpart of
+the gate: restate an already-promoted item's body as the cross-project rule
+*in place*, keeping the concrete version as `example`. For items that reached
+org before the gate (or were forced past it) — the ones `review_promotions()`
+lists under `org_needs_generalization`. Omit `org_content` to fall back to the
+item's latest endorsement note. Writes through the org CAS path (direct, or a
+single shared `cambium/generalize` PR branch when `CAMBIUM_ORG_PR=1`, so
+repeated calls batch into one reviewable PR); idempotent.
+
 **`verify_entry(item_id, note)`** — confirm an entry still holds; stamps its
 `last_verified` to now (optional note). The event that keeps promoted knowledge
 from silently going stale (see *Machine-maintained documentation entropy*).
@@ -311,7 +320,7 @@ never an automatic downgrade. cambium reports the smell; a person decides.
 python3 test_cambium.py
 ```
 
-58 cases against real git repos: **markdown export** (`KNOWLEDGE.md` grouped by
+62 cases against real git repos: **markdown export** (`KNOWLEDGE.md` grouped by
 scope then project with provenance/recalls/promoted-date, cp1252 mojibake
 normalized, auto-written alongside `knowledge.json` on org promotion in both
 direct-push and PR modes), **write-time normalization** (a substrate that feeds
@@ -340,8 +349,12 @@ fast-track, org-requires-endorsement, PR-mode with `gh` stubbed), the
 boundary with its tells and a suggested restatement; `org_content=` generalizes
 and preserves the concrete body as `example`; `force=True` overrides; a clean
 universal body is not over-blocked; `recall` surfaces `endorsed_as`;
-`review_promotions` self-reports `org_needs_generalization`), cross-project
-trust tracking, team-write CAS under a concurrent peer push, **two
+`review_promotions` self-reports `org_needs_generalization`;
+`generalize()` restates an already-promoted body in place, keeps the concrete
+as `example`, clears the flag, and is idempotent), a distill **legacy-field
+fallback** (a pre-v0.4 context-keeper decision carrying only `rationale` still
+distills its WHY), cross-project trust tracking, team-write CAS under a
+concurrent peer push, **two
 real-agentsync integration tests** (drive the actual agentsync claim / finish /
 release tools when the sibling repo is present — including the release-capture
 seam), and a **real MCP stdio transport test**. CI runs it on every push.

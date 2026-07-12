@@ -553,6 +553,78 @@ def _org_add_pr(cfg, item):
     return False, f"PR creation failed: {created.stderr.strip()[:200]}"
 
 
+_ORG_GENERALIZE_BRANCH = "cambium/generalize"
+
+
+def _org_mutate_direct(cfg, fn, message):
+    """CAS in-place edit of the org store on its default branch: sync, apply
+    fn(data) (return False to abort as no-op), re-render md, commit both, push;
+    retry on a rejected push. The edit counterpart of _org_add_direct."""
+    repo = cfg["org_repo"]
+    for attempt in range(PUSH_RETRIES):
+        branch = _org_sync(cfg)
+        data = _org_read_wt(cfg)
+        if fn(data) is False:
+            return True, "no change"
+        with open(os.path.join(repo, KNOWLEDGE_FILE), "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        _write_knowledge_md(repo, data["items"])
+        _git(["add", KNOWLEDGE_FILE, KNOWLEDGE_MD], repo)
+        if not _git(["status", "--porcelain"], repo).stdout.strip():
+            return True, "already current"
+        _git(["commit", "-m", message], repo)
+        if _git(["push", "origin", branch], repo, check=False).returncode == 0:
+            return True, "pushed"
+        time.sleep(0.4 * (attempt + 1))
+    return False, "org push kept losing the race"
+
+
+def _org_mutate_pr(cfg, fn, message):
+    """In-place org edit landed on a single shared PR branch (not the default
+    branch), so repeated edits accumulate into ONE reviewable PR — the same
+    'review is the gate' contract as promote's PR mode, without a PR per item."""
+    repo = cfg["org_repo"]
+    base = _org_sync(cfg)
+    br = _ORG_GENERALIZE_BRANCH
+    # start the branch from the PR tip if it exists, else from base
+    if _git(["ls-remote", "--heads", "origin", br], repo,
+            check=False).stdout.strip():
+        _git(["fetch", "origin", br], repo, check=False)
+        _git(["checkout", "-qB", br, f"origin/{br}"], repo)
+    else:
+        _git(["checkout", "-qB", br, f"origin/{base}"], repo)
+    data = _org_read_wt(cfg)
+    if fn(data) is False:
+        _git(["checkout", "-q", base], repo, check=False)
+        return True, "no change", None
+    with open(os.path.join(repo, KNOWLEDGE_FILE), "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    _write_knowledge_md(repo, data["items"])
+    _git(["add", KNOWLEDGE_FILE, KNOWLEDGE_MD], repo)
+    if _git(["status", "--porcelain"], repo).stdout.strip():
+        _git(["commit", "-m", message], repo)
+    push = _git(["push", "origin", br], repo, check=False)
+    if push.returncode != 0:
+        _git(["checkout", "-q", base], repo, check=False)
+        return False, f"could not push PR branch: {push.stderr.strip()[:200]}", None
+    created = _gh(["pr", "create", "--head", br, "--base", base,
+                   "--title", "cambium: generalize org items for org readership",
+                   "--body", "Restates project-specific org bodies as the "
+                   "cross-project rule (concrete body kept as `example`). "
+                   "Opened/updated by cambium generalize()."],
+                  cwd=repo, check=False)
+    url = ""
+    if created.returncode == 0 and created.stdout.strip():
+        url = created.stdout.strip().splitlines()[-1]
+    else:
+        view = _gh(["pr", "view", br, "--json", "url", "--jq", ".url"],
+                   cwd=repo, check=False)
+        if view.returncode == 0:
+            url = view.stdout.strip()
+    _git(["checkout", "-q", base], repo, check=False)
+    return True, "pr", url
+
+
 # --------------------------------------------------------------------------- #
 # human-readable export — render a knowledge store to KNOWLEDGE.md
 # --------------------------------------------------------------------------- #
@@ -1235,7 +1307,11 @@ def distill() -> str:
                 continue
             item = _new_item(
                 cfg, content, "memory", kind,
-                e.get(why_f) or "",
+                # context-keeper renamed rationale->why_chosen at v0.4 but still
+                # reads both; a pre-v0.4 decision carries only `rationale`, so
+                # fall back to it or the whole WHY (context-keeper's entire
+                # point) is silently dropped while the summary is kept.
+                e.get(why_f) or e.get("rationale") or "",
                 _parse_tags(e.get("tags", [])) + ["context-keeper"],
                 {"system": "context-keeper", "ref": eid},
             )
@@ -1625,6 +1701,86 @@ def promote(item_id: str = "", to_scope: str = "", force: bool = False,
     _write_local(cfg, data)
     moved = [{"id": c["id"], "content": c["content"]} for c in candidates]
     return json.dumps({"status": "promoted", "to": "team", "items": moved},
+                      indent=2)
+
+
+@mcp.tool()
+def generalize(item_id: str, org_content: str = "", note: str = "") -> str:
+    """Restate an ALREADY-PROMOTED item's body as the cross-project rule, in
+    place, keeping the concrete version as `example`. The remediation
+    counterpart of the org generalization gate: items that reached org (or team)
+    before the gate — or were forced past it — are listed by review_promotions()
+    under `org_needs_generalization`; this rewrites one to its general form.
+
+    org_content : the cross-project rule to become the body. If omitted, the
+                  item's latest endorsement note is used (that is where the
+                  generalization was usually already written).
+    note        : optional note recorded as a verification stamp.
+
+    Writes through the org store's CAS path (direct push, or the shared
+    `cambium/generalize` PR branch when CAMBIUM_ORG_PR=1 — repeated calls batch
+    into one reviewable PR), re-rendering KNOWLEDGE.md alongside. Team-scope
+    items are edited via the team CAS path."""
+    cfg, err = _require_cfg()
+    if err:
+        return err
+    src = next((i for i in _read_org(cfg) if i["id"] == item_id), None)
+    scope = "org" if src else None
+    if not src:
+        src = next((i for i in _read_team(cfg) if i["id"] == item_id), None)
+        scope = "team" if src else None
+    if not src:
+        return json.dumps({"error": f"No item '{item_id}' in org or team scope. "
+                           "generalize() edits promoted items; for local ones "
+                           "just recapture."})
+    notes = _endorsement_notes(src)
+    new_body = _demojibake((org_content.strip() or (notes[-1] if notes else "")))
+    if not new_body:
+        return json.dumps({"error": "No org_content given and the item has no "
+                           "endorsement note to fall back on — pass "
+                           "org_content=\"<the cross-project rule>\"."})
+    stamped = _now()
+
+    def mut(data):
+        for i in data["items"]:
+            if i["id"] == item_id:
+                if i["content"] == new_body:
+                    return False  # already generalized — no-op
+                i.setdefault("example", i["content"])  # keep the concrete body
+                i["content"] = new_body
+                i["updated_at"] = stamped
+                i["last_verified"] = stamped
+                if note.strip():
+                    i.setdefault("trust", {}).setdefault(
+                        "endorsements", []).append(
+                        {"by": cfg["agent"], "at": stamped,
+                         "note": _demojibake(note.strip())})
+                return None
+        return False
+
+    msg = f"cambium: generalize {item_id} for org readership"
+    if scope == "org":
+        if not cfg["org_repo"]:
+            return json.dumps({"error": "CAMBIUM_ORG_REPO is not configured."})
+        if cfg["org_pr"]:
+            ok, detail, url = _org_mutate_pr(cfg, mut, msg)
+            if not ok:
+                return json.dumps({"status": "failed", "detail": detail})
+            return json.dumps({"status": "generalized", "scope": "org",
+                               "via": "pr", "pr_url": url, "detail": detail,
+                               "content": new_body, "example": src["content"]},
+                              indent=2)
+        ok, detail = _org_mutate_direct(cfg, mut, msg)
+        if not ok:
+            return json.dumps({"status": "failed", "detail": detail})
+        return json.dumps({"status": "generalized", "scope": "org",
+                           "via": "direct", "detail": detail,
+                           "content": new_body,
+                           "example": src["content"]}, indent=2)
+    if not _team_mutate(cfg, mut, msg):
+        return json.dumps({"status": "retry_exhausted"})
+    return json.dumps({"status": "generalized", "scope": "team",
+                       "content": new_body, "example": src["content"]},
                       indent=2)
 
 

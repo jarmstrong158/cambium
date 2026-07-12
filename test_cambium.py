@@ -282,6 +282,29 @@ def test_distill_from_context_keeper():
         assert "aggregator" in rec["results"][0]["why"], rec
 
 
+def test_distill_reads_legacy_rationale_field():
+    """Pre-v0.4 context-keeper decisions carry `rationale`, not `why_chosen`;
+    distill must still capture the WHY (context-keeper's whole point)."""
+    with lab() as (root, origin, clones):
+        ctx = os.path.join(clones["jonny"], ".context")
+        os.makedirs(ctx, exist_ok=True)
+        decisions = [{
+            "id": "dec-legacy", "schema_version": 1,
+            "summary": "Use event sourcing for the ledger",
+            "rationale": "auditability requires an append-only history",
+            "status": "active",
+            "created_at": "2026-06-01T00:00:00+00:00",
+        }]
+        with open(os.path.join(ctx, "decisions.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(decisions, f, indent=2)
+        be(clones, "jonny")
+        M.distill()
+        it = M._read_local(M._cfg())["items"][0]
+        assert it["kind"] == "decision", it
+        assert "auditability" in it["why"], it
+
+
 def test_distill_is_idempotent():
     with lab() as (root, origin, clones):
         seed_agentsync_branch(clones["stobie"], {"stobie": DONE_CLAIM})
@@ -926,6 +949,62 @@ def test_review_promotions_flags_org_needs_generalization():
         assert "lockstep" in (row["suggested_org_statement"] or ""), row
 
 
+def test_generalize_org_item_in_place_and_clears_flag():
+    with lab() as (root, origin, clones):
+        _, org_clone = setup_org_repo(root)
+        item_id = _seed_team_endorsed(
+            clones, org_clone,
+            "Append every regime boundary to dashboard.py REGIMES",
+            "annotate regime boundaries when a metric's computation changes")
+        M.promote(item_id=item_id, to_scope="org", force=True)  # pre-gate style
+        general = ("Annotate a regime boundary whenever a metric's computation "
+                   "changes, so trends are not misread across it")
+        r = json.loads(M.generalize(item_id, org_content=general))
+        assert r["status"] == "generalized" and r["scope"] == "org", r
+        # the org store now serves the general rule; the concrete stays as example
+        org = M._read_org(M._cfg())
+        it = next(i for i in org if i["id"] == item_id)
+        assert it["content"] == general, it
+        assert "dashboard.py" in it["example"], it
+        # and the tool no longer flags it as needing generalization
+        rv = json.loads(M.review_promotions())
+        assert all(x["id"] != item_id
+                   for x in rv["org_needs_generalization"]), rv
+
+
+def test_generalize_falls_back_to_endorsement_note():
+    with lab() as (root, origin, clones):
+        _, org_clone = setup_org_repo(root)
+        note = "Back up any model checkpoint before a destructive training change"
+        item_id = _seed_team_endorsed(
+            clones, org_clone,
+            "Back up the checkpoint as clark_foundation.pt.bak first", note)
+        M.promote(item_id=item_id, to_scope="org", force=True)
+        r = json.loads(M.generalize(item_id))          # no org_content -> use note
+        assert r["status"] == "generalized", r
+        assert r["content"] == note, r
+        it = next(i for i in M._read_org(M._cfg()) if i["id"] == item_id)
+        assert "clark_foundation" in it["example"], it
+
+
+def test_generalize_is_idempotent():
+    with lab() as (root, origin, clones):
+        _, org_clone = setup_org_repo(root)
+        item_id = _seed_team_endorsed(
+            clones, org_clone,
+            "Keep the schema under 2500 tokens per TestToolSchemaBudget",
+            "Budget an MCP tools/list payload; lazy-load rich guidance")
+        M.promote(item_id=item_id, to_scope="org", force=True)
+        g = "Budget an MCP tools/list payload; lazy-load rich guidance"
+        assert json.loads(M.generalize(item_id, org_content=g))["status"] == \
+            "generalized"
+        # second call is a no-op (content already general), example not clobbered
+        r2 = json.loads(M.generalize(item_id, org_content=g))
+        assert r2.get("detail") in ("no change", "already current"), r2
+        it = next(i for i in M._read_org(M._cfg()) if i["id"] == item_id)
+        assert "TestToolSchemaBudget" in it["example"], it
+
+
 def test_promote_to_org_via_pull_request():
     with lab() as (root, origin, clones):
         org_bare, org_clone = setup_org_repo(root)
@@ -1441,6 +1520,7 @@ TESTS = [
     test_distill_is_idempotent,
     test_distill_reports_missing_substrates,
     test_distill_normalizes_cp1252_mojibake_on_write,
+    test_distill_reads_legacy_rationale_field,
     test_release_capture_is_off_by_default,
     test_release_capture_survives_reclaim_churn,
     test_release_capture_grabs_noted_claim_a_full_distill_would_miss,
@@ -1470,6 +1550,9 @@ TESTS = [
     test_org_promotion_allows_clean_universal_body,
     test_recall_surfaces_endorsed_as,
     test_review_promotions_flags_org_needs_generalization,
+    test_generalize_org_item_in_place_and_clears_flag,
+    test_generalize_falls_back_to_endorsement_note,
+    test_generalize_is_idempotent,
     test_promote_to_org_via_pull_request,
     test_review_promotions_lists_eligible,
     test_export_markdown_publishes_grouped_with_provenance,
