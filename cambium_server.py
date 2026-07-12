@@ -2117,5 +2117,10 @@ def setup(project_repo: str, agent_id: str, org_repo: str = "",
     return json.dumps(result, indent=2)
 
 
-if __name__ == "__main__":
+def main():
+    """Console entry point (pip install cambium-mcp -> `cambium-mcp`)."""
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

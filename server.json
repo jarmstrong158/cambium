@@ -1,0 +1,41 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.jarmstrong158/cambium",
+  "title": "Cambium",
+  "description": "Knowledge-lifecycle MCP: distill agentsync + context-keeper events into memory, recall across projects, promote local -> team -> org.",
+  "repository": {
+    "url": "https://github.com/jarmstrong158/cambium",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "cambium-mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "CAMBIUM_REPO",
+          "description": "Absolute path to the project git clone cambium reads/writes. Defaults to the current repo (cwd git root) when unset.",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "CAMBIUM_AGENT_ID",
+          "description": "Your unique agent id, attributed to captures/endorsements/promotions.",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "CAMBIUM_ORG_REPO",
+          "description": "Path to the org knowledge repo clone (org scope). Omit to keep promotions at team scope.",
+          "isRequired": false,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}
