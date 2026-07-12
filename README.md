@@ -1,5 +1,7 @@
 # cambium
 
+<!-- mcp-name: io.github.jarmstrong158/cambium -->
+
 _Part of the [xylem](https://github.com/jarmstrong158/xylem) stack._
 
 The knowledge-lifecycle MCP that turns work your agents already did into
