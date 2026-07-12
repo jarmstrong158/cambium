@@ -25,5 +25,69 @@
     "created_at": "2026-07-10T17:22:21.500291+00:00",
     "updated_at": "2026-07-10T17:22:21.500291+00:00",
     "verified_at": "2026-07-10T17:22:21.500291+00:00"
+  },
+  {
+    "id": "dec-002-cea7",
+    "summary": "Normalize cp1252 mojibake at the write chokepoint (_new_item), not only in the KNOWLEDGE.md export renderer, so the canonical knowledge.json and recall() serve clean text.",
+    "problem": "_demojibake ran only in the markdown export path, so distill/import/capture stored substrate content verbatim. A cp1252-mangled em-dash from a source (context-keeper .context/, an import export, an agentsync note) persisted in knowledge.json; recall() reads the store directly, so agents received the mojibake while the exported KNOWLEDGE.md looked clean. Observed live: two org items in jarmstrong158/knowledge carried a broken em-dash in the store while the .md rendered fine.",
+    "why_chosen": "_new_item is the single normalize-and-write chokepoint every source already routes through (distill agentsync + context-keeper readers, import adapters, manual capture, valid_while premise), so one edit cleans content/why/tags/source.ref for all paths. _demojibake is already guarded (re-decodes only on a tell-tale lead byte AND a clean cp1252->utf-8 round-trip), so correct text and legitimately-accented content are never corrupted. Export keeps its own _demojibake as belt-and-suspenders for pre-existing data.",
+    "what_we_tried": "Export-only demojibake (the prior state), which left the canonical store and recall() output corrupted while masking the problem in the published doc.",
+    "tradeoffs": "Repair happens at ingest, so items already corrupted in a store are not retroactively cleaned by this change alone (handled separately by a data fix / re-render). Normalization runs on every write, a negligible cost since the guard short-circuits on pure-ASCII text.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [],
+    "tags": [
+      "encoding",
+      "mojibake",
+      "cp1252",
+      "distill",
+      "recall",
+      "data-integrity"
+    ],
+    "retrieval_hints": [
+      "why does cambium clean mojibake on write",
+      "cp1252 em-dash normalization chokepoint",
+      "knowledge.json vs KNOWLEDGE.md divergence"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-12T14:59:28.484046+00:00",
+    "updated_at": "2026-07-12T14:59:28.484046+00:00",
+    "verified_at": "2026-07-12T14:59:28.484046+00:00"
+  },
+  {
+    "id": "dec-003-82c7",
+    "summary": "Gate team->org promotion on generalization: a project-specific body is refused at the org boundary unless restated via org_content= (kept concrete as `example`) or forced. Mirrors the endorsement gate; recall surfaces endorsed_as; review_promotions self-reports org_needs_generalization.",
+    "problem": "promote(to_scope='org') was a pure scope-flag flip that copied the body verbatim. Scopes differ by readership (local=you, org=every project), so a single-repo runbody (names dashboard.py, clark_foundation.pt) promoted unchanged is useless or misleading org-wide, yet gets recalled/cited/institutionalized. The generalization already existed in the endorsement note but recall() buried it in the trust blob, so the right statement was captured and hidden while the wrong one was served.",
+    "why_chosen": "Follows cambium's existing split (Decision 3): crossing into org is a hard gate, drift within a scope is a soft signal. This is a crossing, so it gets a gate mirroring the endorsement gate exactly (same not_* refusal, same force=True override). cambium stays deterministic/model-free: a regex lint (_org_body_smells_local: origin-project name, filenames, test ids, dec/con refs) detects the smell and hands back the endorsement note as a ready draft; the human restates. org_content becomes the org body and the concrete is preserved as example. Companion moves close the loop: recall surfaces endorsement notes as endorsed_as, and review_promotions reports org_needs_generalization so the tool self-diagnoses runbooks that crossed before the gate. Verified against the live org corpus: flags exactly the 4 project-specific items (plus one that names its own project) and leaves the 4 genuinely-universal ones clean.",
+    "what_we_tried": "Considered warn-only lint (rejected: contradicts 'don't make the unsafe org path easy') and recall-only surfacing of endorsement notes (rejected as primary: treats the read symptom, leaves promote shipping un-generalized bodies) -- the latter folded in as a supporting move.",
+    "tradeoffs": "The lint is precision-biased, not exhaustive: a bare word/word 'path' is deliberately NOT a tell (prose uses slashes for lists like survey/claim/update_status, and real paths of concern end in a filename the file-tell catches), so a bare directory path with no filename/project-name can slip through. Accepted because a false block is costlier than a false pass here, and force=True plus the review_promotions backstop catch the remainder.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [],
+    "tags": [
+      "promotion",
+      "org-scope",
+      "generalization",
+      "gate",
+      "recall",
+      "review_promotions",
+      "knowledge-lifecycle"
+    ],
+    "retrieval_hints": [
+      "why does promote to org require org_content",
+      "org generalization gate",
+      "project-specific body refused at org boundary",
+      "endorsed_as in recall"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-12T15:31:11.510527+00:00",
+    "updated_at": "2026-07-12T15:31:11.510527+00:00",
+    "verified_at": "2026-07-12T15:31:11.510527+00:00"
   }
 ]

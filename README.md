@@ -155,14 +155,32 @@ below). Read-only against the source; imported items are not auto-promoted.
 Every hit increments the item's recall counter (the trust signal promotion
 feeds on) and records cross-project use. Abstains honestly: below the relevance
 floor it returns `no_confident_match: true` instead of confident-looking noise.
+Each result carries `endorsed_as` — the item's endorsement notes surfaced as
+first-class context, since for a promoted item that is where its cross-project
+meaning was written.
 
 **`endorse(item_id, note)`** — vouch for an item. Fast-tracks local→team;
 **required** for team→org.
 
-**`promote(item_id, to_scope, force)`** — no args: scan-and-promote all
-eligible local items to team. With `to_scope="org"`: push to the org repo, or
-open a PR when `CAMBIUM_ORG_PR=1` (the team copy stays, annotated, until the
+**`promote(item_id, to_scope, force, org_content)`** — no args: scan-and-promote
+all eligible local items to team. With `to_scope="org"`: push to the org repo,
+or open a PR when `CAMBIUM_ORG_PR=1` (the team copy stays, annotated, until the
 PR merges). Promotion stamps `last_verified` — promotion *is* a verification.
+**Generalization gate:** org scope is read by every project, so a body that
+reads project-specific (names a file, a `test_*` id, a `dec-/con-NNN` ref, or
+its own origin project) is refused at the org boundary — restate it as the
+cross-project rule via `org_content=` (the concrete body is kept as `example`)
+or `force=True` to override. The refusal hands back the endorsement note as a
+ready draft. Mirrors the endorsement gate; the safe path is the easy path.
+
+**`generalize(item_id, org_content, note)`** — the remediation counterpart of
+the gate: restate an already-promoted item's body as the cross-project rule
+*in place*, keeping the concrete version as `example`. For items that reached
+org before the gate (or were forced past it) — the ones `review_promotions()`
+lists under `org_needs_generalization`. Omit `org_content` to fall back to the
+item's latest endorsement note. Writes through the org CAS path (direct, or a
+single shared `cambium/generalize` PR branch when `CAMBIUM_ORG_PR=1`, so
+repeated calls batch into one reviewable PR); idempotent.
 
 **`verify_entry(item_id, note)`** — confirm an entry still holds; stamps its
 `last_verified` to now (optional note). The event that keeps promoted knowledge
@@ -173,7 +191,9 @@ sorted oldest-verified-first, never-reverified ones flagged, each entry's
 `valid_while` premise surfaced. Reports staleness; never auto-downgrades.
 
 **`review_promotions()`** — what's eligible for team, what's endorsed for org,
-which org PRs are pending.
+which org PRs are pending, and `org_needs_generalization` — org items whose body
+still reads project-specific (crossed before the gate, or forced), each with the
+tells found and the endorsement note as a suggested restatement.
 
 **`export_markdown(scope)`** — render knowledge to a human-readable
 `KNOWLEDGE.md`, grouped by scope then project (each item: summary, kind,
@@ -300,7 +320,7 @@ never an automatic downgrade. cambium reports the smell; a person decides.
 python3 test_cambium.py
 ```
 
-52 cases against real git repos: **markdown export** (`KNOWLEDGE.md` grouped by
+62 cases against real git repos: **markdown export** (`KNOWLEDGE.md` grouped by
 scope then project with provenance/recalls/promoted-date, cp1252 mojibake
 normalized, auto-written alongside `knowledge.json` on org promotion in both
 direct-push and PR modes), **write-time normalization** (a substrate that feeds
@@ -324,8 +344,17 @@ would miss it), **import** (JSON + JSONL export → provenance-tagged local item
 re-import dedupes, content-hash fallback without ids, malformed/missing fields
 skipped not crashed, imported items stay local and unpromoted, source left
 untouched), the full promotion lifecycle (recall-threshold, endorsement
-fast-track, org-requires-endorsement, PR-mode with `gh` stubbed), cross-project
-trust tracking, team-write CAS under a concurrent peer push, **two
+fast-track, org-requires-endorsement, PR-mode with `gh` stubbed), the
+**org generalization gate** (a project-specific body is refused at the org
+boundary with its tells and a suggested restatement; `org_content=` generalizes
+and preserves the concrete body as `example`; `force=True` overrides; a clean
+universal body is not over-blocked; `recall` surfaces `endorsed_as`;
+`review_promotions` self-reports `org_needs_generalization`;
+`generalize()` restates an already-promoted body in place, keeps the concrete
+as `example`, clears the flag, and is idempotent), a distill **legacy-field
+fallback** (a pre-v0.4 context-keeper decision carrying only `rationale` still
+distills its WHY), cross-project trust tracking, team-write CAS under a
+concurrent peer push, **two
 real-agentsync integration tests** (drive the actual agentsync claim / finish /
 release tools when the sibling repo is present — including the release-capture
 seam), and a **real MCP stdio transport test**. CI runs it on every push.

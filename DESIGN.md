@@ -103,6 +103,44 @@ Scoring is lexical (token + substring overlap, tags weighted double). That's a
 known limitation, chosen for zero dependencies and deterministic tests;
 embeddings are a swap-in behind the same contract.
 
+## Decision 6 — org is a wider readership, so its body must be generalized
+
+A subtle mismanagement hid in the original `promote()`: team→org was a pure
+scope-flag flip (`item["scope"] = "org"`), copying the body verbatim. But the
+three scopes differ precisely in **readership** — local is you, org is *every*
+project. A body that is correct in one repo ("append to `dashboard.py`
+REGIMES", "back up as `clark_foundation.pt`") is not correct for a reader who
+has no `dashboard.py`; promoted unchanged it is either useless or misleading,
+and — worse — it now carries org-wide blast radius and gets *recalled, cited,
+institutionalized*. Meanwhile the generalization almost always already existed,
+written in the endorsement note ("Universal metrics practice: annotate a regime
+boundary when a metric's computation changes") — and `recall()` buried it inside
+the `trust` blob, so the one right statement was captured and hidden while the
+wrong one was served.
+
+The fix follows cambium's own split (Decision 3): **crossing into org is a
+hard gate; drift within a scope is a soft signal.** This is a crossing, so it
+gets a gate, mirroring the endorsement gate exactly — same `not_*` refusal,
+same `force=True` override. `promote(to_scope="org")` runs a deterministic lint
+(`_org_body_smells_local`: origin-project name, filenames, `test_*`/`Test*`
+ids, `dec-/con-NNN` refs) and, if the body reads project-specific, **refuses**
+unless the caller supplies `org_content=` (the cross-project restatement — the
+concrete body is kept as `example`) or forces it. cambium does not rewrite
+prose (it stays deterministic and model-free); it detects the smell, hands back
+the endorsement note as a ready draft, and lets the human decide at the
+boundary. Two companion moves close the loop: `recall()` surfaces endorsement
+notes as first-class `endorsed_as` context (un-burying the generalization for
+items already promoted), and `review_promotions()` reports
+`org_needs_generalization` — org items whose body still trips the lint — so the
+tool self-diagnoses the runbooks that crossed before the gate existed, instead
+of a human having to eyeball them.
+
+The lint is precision-biased on purpose: a bare `word/word` "path" is *not* a
+tell, because prose uses slashes for lists (`survey/claim/update_status`), and
+every real path of concern already ends in a filename the file-tell catches. A
+false block is more expensive than a false pass here — `force=True` and the
+`review_promotions` backstop both catch what the lint lets through.
+
 ## What is deliberately NOT here
 
 - **Real-time sync / A2A transport** — same argument as agentsync's DESIGN:
