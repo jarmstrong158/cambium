@@ -3,7 +3,7 @@
     "id": "dec-001-bb93",
     "summary": "Ran cambium's first real end-to-end knowledge cycle on balatron history (distill -> recall -> promote to team -> endorse -> org PR -> cross-project recall). Federation validated: balatron-earned knowledge recalled from the Clark project.",
     "problem": "Cambium had never been exercised on a real project's history end to end. We needed to prove the local->team->org promotion lifecycle and, critically, cross-project recall actually work before relying on cambium as the org knowledge layer.",
-    "why_chosen": "Drove cambium_server.py functions directly (the cambium MCP tools were not exposed in the session) with CAMBIUM_REPO=balatron, CAMBIUM_ORG_REPO=knowledge, org PR mode on. distill() produced 80 items (62 decisions + 18 constraints) entirely from context-keeper; agentsync contributed 0 (see companion constraint). Five standing recall queries, run to cross the recalls>=3 gate, promoted 22 items to the team cambium branch via the worktree+CAS path. con-016 (doc-sync) and con-014 (regime-boundary) were endorsed as universal practice and promoted to org as PRs #1/#2 (since merged). Pointing cambium at the Clark repo with the same org store, both items recalled back stamped project=balatron \u00e2\u20ac\u201d the pass condition for compound, cross-project knowledge growth.",
+    "why_chosen": "Drove cambium_server.py functions directly (the cambium MCP tools were not exposed in the session) with CAMBIUM_REPO=balatron, CAMBIUM_ORG_REPO=knowledge, org PR mode on. distill() produced 80 items (62 decisions + 18 constraints) entirely from context-keeper; agentsync contributed 0 (see companion constraint). Five standing recall queries, run to cross the recalls>=3 gate, promoted 22 items to the team cambium branch via the worktree+CAS path. con-016 (doc-sync) and con-014 (regime-boundary) were endorsed as universal practice and promoted to org as PRs #1/#2 (since merged). Pointing cambium at the Clark repo with the same org store, both items recalled back stamped project=balatron \u2014 the pass condition for compound, cross-project knowledge growth.",
     "what_we_tried": "A single pass of the five queries maxed at 2 recalls, so the queries were repeated across 3 rounds to represent recurring usage and cross the promotion gate of 3.",
     "tradeoffs": "Two known frictions surfaced (recorded as constraints): cambium's lexical recall missed con-016 for the phrase 'documentation sync rule' (endorsement path used instead of recall), and parallel org PRs conflicted on knowledge.json.",
     "alternatives": [],
@@ -89,5 +89,37 @@
     "created_at": "2026-07-12T15:31:11.510527+00:00",
     "updated_at": "2026-07-12T15:31:11.510527+00:00",
     "verified_at": "2026-07-12T15:31:11.510527+00:00"
+  },
+  {
+    "id": "dec-004-f4d5",
+    "summary": "Add generalize() to remediate org items that crossed before the gate (restate body in place from the endorsement note, keep concrete as example, PR-batched); and make distill fall back why_chosen -> rationale for pre-v0.4 context-keeper decisions.",
+    "problem": "The generalization gate (dec-003) only prevents FUTURE mis-scoped org crossings; the items already in org before it (5 in the live corpus) still had project-specific bodies with no tool-managed way to fix them \u2014 hand-editing knowledge.json was the anti-pattern the user rejected. Separately, the stack integration audit found distill read decision rationale from why_chosen only; context-keeper renamed rationale->why_chosen at v0.4 but still reads both, so a pre-v0.4 decision's entire WHY was silently dropped while its summary was kept.",
+    "why_chosen": "generalize() is the remediation counterpart of the gate and reuses its parts: it edits a promoted item in place (org via a new _org_mutate_direct/_org_mutate_pr CAS path, team via _team_mutate), defaulting org_content to the item's latest endorsement note (where the restatement already lives), preserving the concrete body as example, and clearing the org_needs_generalization flag; PR mode batches all edits onto one shared cambium/generalize branch so remediation is one reviewable PR. Verified end-to-end: the 5 flagged live items generalized into knowledge#11, detector then clean. The rationale fallback (e.get(why_f) or e.get(\\\"rationale\\\")) mirrors context-keeper's own back-compat, one line, no downside.",
+    "what_we_tried": "",
+    "tradeoffs": "",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [],
+    "tags": [
+      "generalize",
+      "remediation",
+      "org-scope",
+      "distill",
+      "context-keeper",
+      "back-compat",
+      "knowledge-lifecycle"
+    ],
+    "retrieval_hints": [
+      "how to fix an org item that is too project-specific",
+      "cambium generalize tool",
+      "distill drops rationale for legacy decisions"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-12T16:00:34.372851+00:00",
+    "updated_at": "2026-07-12T16:00:34.372851+00:00",
+    "verified_at": "2026-07-12T16:00:34.372851+00:00"
   }
 ]
