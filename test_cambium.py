@@ -33,7 +33,7 @@ AGENTSYNC_PATH = os.path.join(os.path.dirname(HERE), "agentsync",
 CAMBIUM_ENV = [
     "CAMBIUM_REPO", "CAMBIUM_AGENT_ID", "CAMBIUM_ORG_REPO", "CAMBIUM_ORG_PR",
     "CAMBIUM_PROMOTE_RECALLS", "CAMBIUM_TEAM_BRANCH", "CAMBIUM_AGENTSYNC_BRANCH",
-    "CAMBIUM_RELEASE_CAPTURE", "CAMBIUM_CONFIG_FILE",
+    "CAMBIUM_RELEASE_CAPTURE", "CAMBIUM_CONFIG_FILE", "CAMBIUM_MODE",
 ]
 
 
@@ -820,7 +820,11 @@ def test_team_recall_tracks_cross_project_usage():
 def test_promote_team_to_org_requires_endorsement():
     with lab() as (root, origin, clones):
         org_bare, org_clone = setup_org_repo(root)
-        be(clones, "jonny", CAMBIUM_ORG_REPO=org_clone, CAMBIUM_PROMOTE_RECALLS="1")
+        # Force team mode: this test asserts the TEAM contract (a peer must
+        # endorse). A single-agent lab auto-detects solo, which intentionally
+        # waives that gate (see the solo fast-lane tests below).
+        be(clones, "jonny", CAMBIUM_ORG_REPO=org_clone, CAMBIUM_PROMOTE_RECALLS="1",
+           CAMBIUM_MODE="team")
         item_id = json.loads(M.capture("org-worthy: all services use UTC "
                                        "everywhere, never local time",
                                        tags="time utc"))["item"]["id"]
@@ -841,6 +845,51 @@ def test_promote_team_to_org_requires_endorsement():
         # and org scope is recallable by anyone configured with the org repo
         rec = json.loads(M.recall("what timezone do services use", scope="org"))
         assert rec["results"] and rec["results"][0]["scope"] == "org", rec
+
+
+def test_solo_fast_lane_local_to_org():
+    """A solo builder (one identity -> auto solo) promotes straight from local to
+    org in a single call: no team hop, no separate endorse(). The promote call is
+    the vouch and is auto-stamped as an endorsement for the audit trail."""
+    with lab() as (root, origin, clones):
+        org_bare, org_clone = setup_org_repo(root)
+        be(clones, "jonny", CAMBIUM_ORG_REPO=org_clone)  # no MODE -> auto -> solo
+        item_id = json.loads(M.capture(
+            "Universal practice: all services use UTC everywhere, never local time",
+            tags="time utc"))["item"]["id"]
+        # local -> org directly; never staged to team, never endorsed by hand
+        r = json.loads(M.promote(item_id=item_id, to_scope="org"))
+        assert r["status"] == "promoted" and r["to"] == "org", r
+        assert r["mode"] == "solo" and r["from"] == "local", r
+        # landed on org with an auto-stamped self-endorsement
+        p = git(["show", "origin/main:knowledge.json"],
+                os.path.join(root, "org-clone"))
+        promoted = next(i for i in json.loads(p.stdout)["items"]
+                        if i["id"] == item_id)
+        ends = promoted["trust"]["endorsements"]
+        assert len(ends) == 1 and ends[0]["by"] == "jonny", promoted
+        # removed from local
+        assert all(i["id"] != item_id
+                   for i in M._read_local(M._cfg())["items"])
+
+
+def test_solo_fast_lane_still_enforces_generalization():
+    """Solo does NOT skip the generalization gate: a project-specific body is
+    still refused until restated for a cross-project readership."""
+    with lab() as (root, origin, clones):
+        org_bare, org_clone = setup_org_repo(root)
+        be(clones, "jonny", CAMBIUM_ORG_REPO=org_clone)
+        item_id = json.loads(M.capture(
+            "append the new REGIME to dashboard.py after each accounting change",
+            tags="dashboard"))["item"]["id"]
+        r = json.loads(M.promote(item_id=item_id, to_scope="org"))
+        assert r["status"] == "not_generalized", r
+        # the cross-project restatement lets it through
+        r = json.loads(M.promote(
+            item_id=item_id, to_scope="org",
+            org_content="Annotate a regime boundary whenever a metric's "
+                        "computation changes."))
+        assert r["status"] == "promoted" and r["to"] == "org", r
 
 
 # --------------------------------------------------------------------------- #

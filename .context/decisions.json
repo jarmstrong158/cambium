@@ -121,5 +121,103 @@
     "created_at": "2026-07-12T16:00:34.372851+00:00",
     "updated_at": "2026-07-12T16:00:34.372851+00:00",
     "verified_at": "2026-07-12T16:00:34.372851+00:00"
+  },
+  {
+    "id": "dec-005-d6e5",
+    "summary": "Make cambium project-aware for the solo-operator-is-org model: CAMBIUM_REPO defaults to the cwd git root when unset, so one config (org_repo + agent_id) serves every project; the SessionEnd hook also reads the session cwd from its payload.",
+    "problem": "The operator is the org and works across many solo projects; local->team->org collapses to per-project->one shared knowledge brain. A global SessionEnd distill hook pinned to a single CAMBIUM_REPO would only ever capture one project, and interactive recall/promote would target the wrong repo.",
+    "why_chosen": "Rather than require per-project cambium config, CAMBIUM_REPO falls back to the git root at/above cwd (new _git_root helper) in _cfg and _config_state when set in neither env nor config file. One config sets the stable pieces (CAMBIUM_ORG_REPO = the knowledge repo, CAMBIUM_AGENT_ID); the project is whatever repo the session is in. _config_source reports source 'cwd' so status stays coherent. The SessionEnd hook additionally reads the payload cwd and sets CAMBIUM_REPO (belt-and-suspenders, since the hook process cwd may differ from the session project). Team scope is vestigial for a solo org but harmless. Verified: cambium 63/63, xylem 75/75.",
+    "what_we_tried": "",
+    "tradeoffs": "",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [],
+    "tags": [
+      "cwd-aware",
+      "solo-operator",
+      "org-scope",
+      "config",
+      "distill-hook",
+      "knowledge-lifecycle"
+    ],
+    "retrieval_hints": [
+      "cambium defaults CAMBIUM_REPO to current project",
+      "solo dev is the org config",
+      "SessionEnd hook distills whichever project"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-12T17:11:48.488767+00:00",
+    "updated_at": "2026-07-12T17:11:48.488767+00:00",
+    "verified_at": "2026-07-12T17:11:48.488767+00:00"
+  },
+  {
+    "id": "dec-006-d1f9",
+    "summary": "Do not add semantic (embedding) recall to cambium yet. Keep the lexical token-overlap scorer (_score). Re-evaluate when the knowledge base crosses ~100 items using bench_recall.py.",
+    "problem": "Recall is currently lexical (token overlap), documented in _score as \"the semantic upgrade is a later swap.\" Raised: how hard is semantic recall and is it worth doing now? Needed a data-backed answer before spending effort, and before giving up the zero-dependency property that embeddings would cost.",
+    "why_chosen": "Ran bench_recall.py against the live 9-item knowledge base with 18 queries (9 control sharing vocabulary, 9 paraphrases using different words). The correct item scored 0.50-1.00 in ALL 18 cases, always far above the 0.2 abstention floor; zero true recall misses. Paraphrase top-1 (89%) equaled control (89%): substring matching plus double-weighted tags close the synonym gap at this scale. The only 2 top-1 failures were the same homonym collision on \"sync\" (decision-log-sync vs state-mirror-sync), which embeddings do NOT reliably fix and which surface at rank 2 anyway (limit=5). Embeddings would cost a dependency, kill the zero-dependency selling point, force recalibration of the floor, and fix nothing the data shows.",
+    "what_we_tried": "Built bench_recall.py (in cambium repo) as the repeatable measurement. Considered three embedding approaches: local model (fastembed/ONNX MiniLM ~90MB), embedding API (Voyage/OpenAI; Claude has no embeddings endpoint), and hybrid flag-gated reranking. Hybrid is the preferred approach IF the trigger fires.",
+    "tradeoffs": "Homonym near-misses (correct item at rank 2) persist for now; mitigated by tag hygiene, not embeddings. Result is sample-size-limited: 9 items is tiny and tag-rich, so the picture changes with more or sloppier entries, hence the explicit re-eval trigger.",
+    "alternatives": [],
+    "constraints_created": [
+      "Re-run bench_recall.py when the cambium knowledge base crosses ~100 items; build hybrid embedding recall only if paraphrase top-1 drops below ~70% OR a gold item falls below the abstention floor. Homonym collisions alone are not a trigger; fix tags instead."
+    ],
+    "related_to": [],
+    "tags": [
+      "cambium",
+      "recall",
+      "embeddings",
+      "semantic-search",
+      "benchmark",
+      "zero-dependency"
+    ],
+    "retrieval_hints": [
+      "should we add semantic recall to cambium",
+      "embedding recall vs lexical",
+      "is token overlap good enough",
+      "when to build vector search"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-12T22:10:58.257221+00:00",
+    "updated_at": "2026-07-12T22:10:58.257221+00:00",
+    "verified_at": "2026-07-12T22:10:58.257221+00:00"
+  },
+  {
+    "id": "dec-007-ffec",
+    "summary": "Added solo/team auto-detection to cambium with a solo fast-lane for org promotion. Detection is automatic and reversible; the generalization gate is never relaxed.",
+    "problem": "cambium's promotion ladder (local -> team -> org) rests on three trust signals, two of which assume other people: peer endorsement and org PR review. For a solo builder those collapse to self-endorsement and self-reviewed PRs, so the team tier and the mandatory endorsement gate become ceremony with no one to perform them. The user wanted the process to be effective solo WITHOUT removing any team utility.",
+    "why_chosen": "Detection is inferred, not configured: _detect_mode() counts distinct identities ever seen (configured agent + agentsync claim owners + endorsement by-fields across local/team/org); <=1 is solo. CAMBIUM_MODE=auto|solo|team overrides. In solo mode, promote(item_id, to_scope=\"org\") may originate from LOCAL (skips the team hop) and the deliberate promote call itself counts as the endorsement (auto-stamped {by: agent} for the audit trail). This is purely additive: team mode behavior is byte-identical to before, so nothing is lost when a team exists. It is reversible with zero migration: the day a second collaborator claims or endorses anything, detection flips to team and the full peer-endorsement ladder re-engages. The user chose the \"fast lane\" option (promote = the vouch) over keeping a separate explicit endorse step.",
+    "what_we_tried": "Considered a plain CAMBIUM_SOLO flag (rejected: manual, and would collapse the tier rather than adapt). Considered auto-satisfying endorsement in solo mode without allowing the direct local->org hop (that was the runner-up option offered). Chose inference + fast-lane because it grows with the user.",
+    "tradeoffs": "The one quality bar that is NEVER relaxed is the generalization gate (_org_body_smells_local): a project-specific body still must be restated via org_content before it can reach org, in every mode. So solo speeds up the ceremony but not the abstraction discipline, which is the piece that actually matters for a multi-project solo dev. Cost: _detect_mode does a git fetch of the agentsync branch (acceptable, promote already does git ops).",
+    "alternatives": [],
+    "constraints_created": [
+      "The solo fast-lane must never relax cambium's generalization gate (_org_body_smells_local): a project-specific body always requires an org_content restatement (or force=True) before promotion to org, regardless of solo/team mode."
+    ],
+    "related_to": [],
+    "tags": [
+      "cambium",
+      "promotion",
+      "solo-mode",
+      "trust-gates",
+      "auto-detection"
+    ],
+    "retrieval_hints": [
+      "how does cambium detect solo vs team",
+      "solo fast lane org promotion",
+      "why can I promote local straight to org",
+      "CAMBIUM_MODE"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-14T23:39:14.260479+00:00",
+    "updated_at": "2026-07-14T23:39:14.260479+00:00",
+    "verified_at": "2026-07-14T23:39:14.260479+00:00"
   }
 ]

@@ -207,6 +207,7 @@ def _cfg():
         "release_capture": _resolve("CAMBIUM_RELEASE_CAPTURE", file_cfg, "") == "1",
         "promote_recalls": int(_resolve("CAMBIUM_PROMOTE_RECALLS", file_cfg, "3")
                                or "3"),
+        "mode": (_resolve("CAMBIUM_MODE", file_cfg, "auto") or "auto").lower(),
         "worktree": os.path.join(repo, ".git", "cambium-wt"),
         "local_store": os.path.join(repo, LOCAL_DIR, KNOWLEDGE_FILE),
         "context_dir": os.path.join(repo, ".context"),
@@ -847,6 +848,52 @@ def _eligible_team(cfg, item):
 
 def _eligible_org(item):
     return len(item.get("trust", {}).get("endorsements", [])) >= 1
+
+
+def _distinct_identities(cfg):
+    """Every identity that has ever acted in this coordination space: the
+    configured agent, agentsync claim owners, and everyone who has endorsed an
+    item at any scope. This is the raw signal for solo-vs-team auto-detection --
+    one identity means nobody else is here. Best-effort: any unreadable source is
+    skipped, never fatal."""
+    ids = set()
+    if cfg.get("agent"):
+        ids.add(cfg["agent"])
+    try:
+        repo, remote, br = cfg["repo"], cfg["remote"], cfg["agentsync_branch"]
+        _git(["fetch", remote, br], repo, check=False)
+        claims = _show_file(repo, f"{remote}/{br}", "claims.json")
+        if isinstance(claims, dict):
+            for owner in (claims.get("claims", {}) or {}):
+                ids.add(owner)
+    except Exception:
+        pass
+
+    def _endorsers(items):
+        for it in items or []:
+            for e in it.get("trust", {}).get("endorsements", []):
+                who = e.get("by")
+                if who:
+                    ids.add(who)
+    for src in (lambda: _read_local(cfg)["items"],
+                lambda: _read_team(cfg),
+                lambda: _read_org(cfg)):
+        try:
+            _endorsers(src())
+        except Exception:
+            pass
+    return ids
+
+
+def _detect_mode(cfg):
+    """'solo' or 'team'. CAMBIUM_MODE forces it; 'auto' (default) infers from the
+    number of distinct identities ever seen -- <=1 is solo. Reversible: the day a
+    second collaborator claims or endorses anything, this flips to 'team' and the
+    full peer-endorsement ladder re-engages, with no migration."""
+    m = (cfg.get("mode") or "auto").lower()
+    if m in ("solo", "team"):
+        return m
+    return "solo" if len(_distinct_identities(cfg)) <= 1 else "team"
 
 
 # --------------------------------------------------------------------------- #
@@ -1612,25 +1659,49 @@ def promote(item_id: str = "", to_scope: str = "", force: bool = False,
     if err:
         return err
 
-    # ---- explicit team -> org ------------------------------------------- #
+    # ---- team -> org, plus the solo local -> org fast lane -------------- #
     if item_id and to_scope == "org":
         if not cfg["org_repo"]:
             return json.dumps({"error": "CAMBIUM_ORG_REPO is not configured."})
-        team_items = _read_team(cfg)
-        src = next((i for i in team_items if i["id"] == item_id), None)
+        mode = _detect_mode(cfg)
+        # Team is the normal origin for an org promotion. A solo builder can also
+        # promote straight from local -- the team hop only earns its keep when
+        # there is actually a team to stage for.
+        src = next((i for i in _read_team(cfg) if i["id"] == item_id), None)
+        src_scope = "team" if src else None
+        if not src and mode == "solo":
+            src = next((i for i in _read_local(cfg)["items"]
+                        if i["id"] == item_id), None)
+            if src:
+                src_scope = "local"
         if not src:
-            return json.dumps({"error": f"No item '{item_id}' in team scope. "
-                               "Promote local items to team first."})
-        if not force and not _eligible_org(src):
+            hint = ("Promote local items to team first." if mode == "team"
+                    else "No such item in team or local scope.")
+            return json.dumps({"error": f"No item '{item_id}' in team scope. {hint}"})
+
+        item = dict(src)
+        stamped = _now()
+        # Endorsement gate. Team scope needs a peer's deliberate vouch. In solo
+        # mode this promote-to-org call IS that deliberate act, so it counts as
+        # the endorsement (auto-stamped for the audit trail). The generalization
+        # gate below is NOT relaxed -- it is the quality bar that survives solo.
+        if mode == "solo":
+            item.setdefault("trust", {}).setdefault("endorsements", [])
+            if not item["trust"]["endorsements"]:
+                item["trust"]["endorsements"] = [{
+                    "by": cfg["agent"], "at": stamped,
+                    "note": "solo fast-lane: promote to org is the vouch",
+                }]
+        elif not force and not _eligible_org(src):
             return json.dumps({
                 "status": "not_eligible",
                 "message": "team->org requires at least one endorsement "
                            "(endorse() it, or force=True).",
             })
-        item = dict(src)
-        stamped = _now()
+
         # Generalization gate: org is a wider readership than any one repo, so a
         # project-specific body must be restated before it crosses (or forced).
+        # Enforced in EVERY mode -- solo does not get to skip this.
         if org_content.strip():
             item["example"] = item["content"]  # keep the concrete runbook
             item["content"] = _demojibake(org_content.strip())
@@ -1651,30 +1722,53 @@ def promote(item_id: str = "", to_scope: str = "", force: bool = False,
         item["scope"] = "org"
         item["updated_at"] = stamped
         item["last_verified"] = stamped  # promotion IS a verification
+
+        # Drop or stamp the promoted copy in its source scope (team branch, or
+        # the local store for the solo fast lane).
+        def _drop_source():
+            if src_scope == "team":
+                def remove(data):
+                    before = len(data["items"])
+                    data["items"] = [i for i in data["items"]
+                                     if i["id"] != item_id]
+                    return None if len(data["items"]) != before else False
+                _team_mutate(cfg, remove, f"cambium: {item_id} promoted to org")
+            else:
+                ld = _read_local(cfg)
+                ld["items"] = [i for i in ld["items"] if i["id"] != item_id]
+                _write_local(cfg, ld)
+
+        def _stamp_source_pr(url):
+            if src_scope == "team":
+                def mark(data):
+                    for i in data["items"]:
+                        if i["id"] == item_id:
+                            i["promotion"] = {"pr": url, "at": _now()}
+                            return None
+                    return False
+                _team_mutate(cfg, mark, f"cambium: org PR opened for {item_id}")
+            else:
+                ld = _read_local(cfg)
+                for i in ld["items"]:
+                    if i["id"] == item_id:
+                        i["promotion"] = {"pr": url, "at": _now()}
+                _write_local(cfg, ld)
+
         if cfg["org_pr"]:
             ok, url = _org_add_pr(cfg, item)
             if not ok:
                 return json.dumps({"status": "failed", "detail": url})
-            def mark(data):
-                for i in data["items"]:
-                    if i["id"] == item_id:
-                        i["promotion"] = {"pr": url, "at": _now()}
-                        return None
-                return False
-            _team_mutate(cfg, mark, f"cambium: org PR opened for {item_id}")
-            return json.dumps({"status": "pr_opened", "pr_url": url,
-                               "note": "team copy stays until the PR merges"},
+            _stamp_source_pr(url)
+            return json.dumps({"status": "pr_opened", "pr_url": url, "mode": mode,
+                               "from": src_scope,
+                               "note": f"{src_scope} copy stays until the PR merges"},
                               indent=2)
         ok, err = _org_add_direct(cfg, item)
         if not ok:
             return json.dumps({"status": "failed", "detail": err})
-        def remove(data):
-            before = len(data["items"])
-            data["items"] = [i for i in data["items"] if i["id"] != item_id]
-            return None if len(data["items"]) != before else False
-        _team_mutate(cfg, remove, f"cambium: {item_id} promoted to org")
-        return json.dumps({"status": "promoted", "to": "org",
-                           "item": item}, indent=2)
+        _drop_source()
+        return json.dumps({"status": "promoted", "to": "org", "mode": mode,
+                           "from": src_scope, "item": item}, indent=2)
 
     # ---- local -> team (single or scan) ----------------------------------- #
     data = _read_local(cfg)
@@ -1971,6 +2065,7 @@ def status() -> str:
         return {"total": len(items), "by_type": by_type}
 
     state.update({
+        "mode": _detect_mode(cfg),
         "scopes": {"local": count(local["items"]), "team": count(team),
                    "org": count(org) if cfg["org_repo"] else "not configured"},
         "imported": {"context_keeper": len(local["imported"]["context_keeper"]),
