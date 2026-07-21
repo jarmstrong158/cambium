@@ -863,8 +863,14 @@ def _tokens(text):
 
 def _score(item, q_tokens):
     """Fraction of query tokens the item matches; tags and kind count double,
-    and tokens >=3 chars match by substring either way (jwt~jwts, hash~hashing).
-    Deterministic, dependency-free — the semantic upgrade is a later swap."""
+    and tokens >=3 chars match on a shared PREFIX (jwt~jwts, hash~hashing) so a
+    stem matches its inflections. Prefix, not bare infix: an earlier version used
+    `tok in w or w in tok`, which let a short token match anywhere inside a longer
+    word — "art" scored a hit on "start", "cat" on "locate" — inflating unrelated
+    items and (since recall counts feed promotion) their trust. Requiring one to
+    be a prefix of the other keeps the intended stem/plural matches while dropping
+    those infix/suffix false positives. Deterministic, dependency-free — the
+    semantic upgrade is a later swap."""
     if not q_tokens:
         return 0.0
     body = _tokens(item.get("content", "")) | _tokens(item.get("why", ""))
@@ -876,7 +882,7 @@ def _score(item, q_tokens):
         elif tok in body or any(tok in t for t in tagset):
             hits += 1.0
         elif len(tok) >= 3 and any(
-            (tok in w or w in tok) for w in body if len(w) >= 3
+            (w.startswith(tok) or tok.startswith(w)) for w in body if len(w) >= 3
         ):
             hits += 1.0
     return min(1.0, hits / len(q_tokens))

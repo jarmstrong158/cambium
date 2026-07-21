@@ -881,6 +881,18 @@ def test_recall_credit_deduped_per_agent_day():
         assert it["trust"]["recalls"] == 2, it
 
 
+def test_score_matches_prefix_stem_not_bare_infix():
+    """A >=3-char query token matches a stored word only on a shared PREFIX
+    (stem/plural: hash~hashing), never a bare infix/suffix (art~start) — so a
+    short query token can't spuriously score, and inflate the trust of, an
+    unrelated item."""
+    stem = {"content": "argon2 password hashing", "tags": [], "kind": "note"}
+    assert M._score(stem, M._tokens("hash")) == 1.0     # prefix stem still hits
+    infix = {"content": "the program will start soon", "tags": [], "kind": "note"}
+    assert M._score(infix, M._tokens("art")) == 0.0     # 'art' no longer hits 'start'
+    assert M._score(infix, M._tokens("start")) == 1.0   # exact token unaffected
+
+
 # --------------------------------------------------------------------------- #
 # local store durability
 # --------------------------------------------------------------------------- #
@@ -1750,6 +1762,7 @@ TESTS = [
     test_promote_explicit_id_respects_threshold_and_force,
     test_team_recall_tracks_cross_project_usage,
     test_recall_credit_deduped_per_agent_day,
+    test_score_matches_prefix_stem_not_bare_infix,
     test_local_store_corruption_is_quarantined_not_lost,
     test_deprecate_local_hides_from_recall,
     test_deprecate_reaches_team_scope,
