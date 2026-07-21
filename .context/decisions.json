@@ -303,5 +303,36 @@
     "created_at": "2026-07-21T13:50:06.074801+00:00",
     "updated_at": "2026-07-21T13:50:06.074801+00:00",
     "verified_at": "2026-07-21T13:50:06.074801+00:00"
+  },
+  {
+    "id": "dec-011-0dc6",
+    "summary": "distill() now re-syncs source lifecycle: it reads the full context-keeper entry set each run, auto-deprecates LOCAL cambium items whose source decision/constraint became superseded/deprecated, and REPORTS (does not auto-push) promoted team/org copies. It also keeps the decision's `problem` in the distilled `why`, and stops mislabeling a corrupt .context store as read.",
+    "problem": "Audit found cambium never re-synced a source decision's lifecycle: once distilled while active, a decision that context-keeper later superseded/deprecated stayed active and recallable in cambium and could climb to org, where promotion stamps last_verified so it looks freshly verified \u2014 wrong knowledge institutionalized. The decision's `problem` (what forced it) was also dropped, removing the context needed to judge org-worthiness; and a corrupt .context file was reported as 'read'.",
+    "why_chosen": "Reading the full entry set (not just active) lets one distill pass both import new active entries and expire retired ones. Auto-deprecation is scoped to LOCAL only \u2014 where distill already writes \u2014 because auto-pushing deprecations to the shared team/org branch from an automatic SessionEnd hook would violate cambium's 'org is a hard gate' rule; promoted stale copies are surfaced as stale_promoted with a suggested deprecate() call for a deliberate act. Folding `problem` into `why` makes it recalled and visible at the promotion gate without a new field. Setting ck_seen only after a successful load stops a corrupt store from looking captured.",
+    "what_we_tried": "",
+    "tradeoffs": "The team/org stale scan does 1-2 extra git reads per distill, but only when some source entry is actually retired. deprecated cambium items remain in the store (filtered from recall/export) for audit; reactivation stays manual.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [
+      "dec-008-7aa6",
+      "dec-010-407a"
+    ],
+    "tags": [
+      "cambium",
+      "distill",
+      "lifecycle",
+      "resync",
+      "org",
+      "staleness",
+      "context-keeper"
+    ],
+    "retrieval_hints": [],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-21T14:16:18.117824+00:00",
+    "updated_at": "2026-07-21T14:16:18.117824+00:00",
+    "verified_at": "2026-07-21T14:16:18.117824+00:00"
   }
 ]
