@@ -907,6 +907,19 @@ def _recall_mark(cfg):
     return "%s|%s" % (cfg["agent"], _now()[:10])
 
 
+def _retire_synced(item, ref, source_status):
+    """Deprecate a cambium item in place because the source entry it was
+    distilled from (context-keeper `ref`) is now superseded/deprecated. Same
+    status field deprecate() sets, so it drops out of recall/export/promotion,
+    with a reason that traces back to the source."""
+    now = _now()
+    item["status"] = "deprecated"
+    item["deprecated_at"] = now
+    item["deprecated_reason"] = ("source context-keeper %s is now %s"
+                                 % (ref, source_status))
+    item["updated_at"] = now
+
+
 def _credit_recall(item, mark):
     """Record one recall credit against an item unless this (agent, day) mark is
     already counted. Returns True if it was newly credited. Legacy items have a
@@ -1422,7 +1435,13 @@ def distill() -> str:
         verification_prompt = _verification_prompt(cfg, list(new_items))
 
     # --- source 2: context-keeper .context/ ------------------------------- #
+    # Read the FULL entry set (not only active) so distill can do two jobs:
+    # import new active entries, AND re-sync the lifecycle of ones imported
+    # earlier. Trust-gated promotion defends knowledge on the way IN; without a
+    # re-sync, a decision context-keeper later supersedes/deprecates keeps living
+    # as active cambium knowledge — recalled, and free to climb to org.
     ck_seen = False
+    ck_status = {}   # eid -> current context-keeper status
     for fname, kind, text_f, why_f in (
         ("decisions.json", "decision", "summary", "why_chosen"),
         ("constraints.json", "constraint", "rule", "reason"),
@@ -1430,32 +1449,79 @@ def distill() -> str:
         path = os.path.join(cfg["context_dir"], fname)
         if not os.path.exists(path):
             continue
-        ck_seen = True
         try:
             with open(path, encoding="utf-8") as f:
                 entries = json.load(f)
         except (OSError, json.JSONDecodeError):
+            # A corrupt/unreadable store must NOT be reported as read: the old
+            # code set ck_seen before this load, so a corrupt file looked
+            # captured. Leaving ck_seen alone here keeps "read" honest.
             continue
+        ck_seen = True
         for e in entries if isinstance(entries, list) else []:
             eid = e.get("id", "")
-            if not eid or eid in imported_ck or e.get("status") not in (None, "active"):
+            if not eid:
+                continue
+            status = e.get("status") or "active"
+            ck_status[eid] = status
+            if eid in imported_ck or status != "active":
                 continue
             content = e.get(text_f) or ""
             if not content:
                 continue
+            # context-keeper renamed rationale->why_chosen at v0.4 but still reads
+            # both; a pre-v0.4 decision carries only `rationale`.
+            why = e.get(why_f) or e.get("rationale") or ""
+            # Keep the decision's `problem` (what forced it). Dropping it left
+            # cambium — and org readers at the promotion gate — unable to judge
+            # whether a decision was context-specific or a general rule.
+            problem = (e.get("problem") or "").strip()
+            if problem:
+                why = ("%s  Problem: %s" % (why, problem)).strip() if why \
+                    else "Problem: %s" % problem
             item = _new_item(
-                cfg, content, "memory", kind,
-                # context-keeper renamed rationale->why_chosen at v0.4 but still
-                # reads both; a pre-v0.4 decision carries only `rationale`, so
-                # fall back to it or the whole WHY (context-keeper's entire
-                # point) is silently dropped while the summary is kept.
-                e.get(why_f) or e.get("rationale") or "",
+                cfg, content, "memory", kind, why,
                 _parse_tags(e.get("tags", [])) + ["context-keeper"],
                 {"system": "context-keeper", "ref": eid},
             )
             data["items"].append(item)
             data["imported"]["context_keeper"].append(eid)
             new_items.append(item)
+
+    # Lifecycle re-sync. Deprecate any LOCAL cambium item whose source is now
+    # superseded/deprecated, so a retired decision stops being served by recall()
+    # and can't keep climbing. Promoted copies (team/org) are only REPORTED for a
+    # deliberate deprecate() — auto-pushing deprecations to shared scopes from an
+    # automatic hook would violate cambium's "org is a hard gate" rule.
+    resynced = []
+    stale_promoted = []
+    retired = {eid for eid, st in ck_status.items()
+               if st in ("superseded", "deprecated")}
+    if retired:
+        for i in data["items"]:
+            src = i.get("source") or {}
+            if (src.get("system") == "context-keeper"
+                    and src.get("ref") in retired
+                    and i.get("status") == "active"):
+                st = ck_status[src["ref"]]
+                _retire_synced(i, src["ref"], st)
+                resynced.append({"id": i["id"], "ref": src["ref"],
+                                 "source_status": st})
+        try:
+            promoted = [("team", i) for i in _read_team(cfg)]
+            if cfg["org_repo"]:
+                promoted += [("org", i) for i in _read_org(cfg)]
+            for scope, i in promoted:
+                src = i.get("source") or {}
+                if (src.get("system") == "context-keeper"
+                        and src.get("ref") in retired
+                        and i.get("status") == "active"):
+                    stale_promoted.append({
+                        "scope": scope, "id": i["id"], "ref": src["ref"],
+                        "source_status": ck_status[src["ref"]],
+                        "action": "deprecate(%r)" % i["id"]})
+        except Exception:
+            pass  # best-effort; a missing remote scope never fails a distill
 
     _write_local(cfg, data)
     return json.dumps(
@@ -1464,6 +1530,8 @@ def distill() -> str:
             "new_items": len(new_items),
             "released_captured": released_captured,
             "release_capture": cfg["release_capture"],
+            "resynced": resynced,
+            "stale_promoted": stale_promoted,
             "verification_prompt": verification_prompt,
             "sources": {
                 "agentsync": "read" if agentsync_seen else "no coordination branch found",

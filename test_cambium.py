@@ -319,6 +319,64 @@ def test_distill_from_context_keeper():
         assert "aggregator" in rec["results"][0]["why"], rec
 
 
+def _supersede_decision(clone, dec_id, status="superseded"):
+    ctx = os.path.join(clone, ".context")
+    path = os.path.join(ctx, "decisions.json")
+    decs = json.load(open(path, encoding="utf-8"))
+    for e in decs:
+        if e["id"] == dec_id:
+            e["status"] = status
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(decs, f, indent=2)
+
+
+def test_distill_keeps_the_decision_problem_in_why():
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny")
+        M.distill()
+        item = next(i for i in M._read_local(M._cfg())["items"]
+                    if i.get("source", {}).get("ref") == "dec-001")
+        assert "Problem:" in item["why"] and "KDF choice" in item["why"], item
+
+
+def test_distill_resyncs_superseded_source_and_stops_recalling_it():
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny")
+        M.distill()
+        assert json.loads(M.recall("argon2id memory hard"))["results"]
+        # context-keeper supersedes the decision; a re-distill must propagate it
+        _supersede_decision(clones["jonny"], "dec-001")
+        d = json.loads(M.distill())
+        assert any(r["ref"] == "dec-001" for r in d["resynced"]), d
+        item = next(i for i in M._read_local(M._cfg())["items"]
+                    if i.get("source", {}).get("ref") == "dec-001")
+        assert item["status"] == "deprecated", item
+        assert "superseded" in item["deprecated_reason"], item
+        # retired knowledge is no longer served
+        assert not json.loads(M.recall("argon2id memory hard"))["results"]
+
+
+def test_distill_reports_but_does_not_auto_deprecate_a_promoted_stale_source():
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny")
+        M.distill()
+        iid = next(i["id"] for i in M._read_local(M._cfg())["items"]
+                   if i.get("source", {}).get("ref") == "dec-001")
+        M.endorse(iid)
+        M.promote()                                   # dec-001 memory -> team
+        _supersede_decision(clones["jonny"], "dec-001")
+        d = json.loads(M.distill())
+        assert any(s["scope"] == "team" and s["ref"] == "dec-001"
+                   for s in d["stale_promoted"]), d
+        # org is a hard gate: distill reports it, it does NOT auto-push a
+        # deprecation to the shared team branch.
+        team_item = next(i for i in M._read_team(M._cfg()) if i["id"] == iid)
+        assert team_item["status"] == "active", team_item
+
+
 def test_distill_reads_legacy_rationale_field():
     """Pre-v0.4 context-keeper decisions carry `rationale`, not `why_chosen`;
     distill must still capture the WHY (context-keeper's whole point)."""
@@ -1780,6 +1838,9 @@ TESTS = [
     test_distill_reports_missing_substrates,
     test_distill_normalizes_cp1252_mojibake_on_write,
     test_distill_reads_legacy_rationale_field,
+    test_distill_keeps_the_decision_problem_in_why,
+    test_distill_resyncs_superseded_source_and_stops_recalling_it,
+    test_distill_reports_but_does_not_auto_deprecate_a_promoted_stale_source,
     test_release_capture_is_off_by_default,
     test_release_capture_survives_reclaim_churn,
     test_release_capture_grabs_noted_claim_a_full_distill_would_miss,
