@@ -30,6 +30,30 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 AGENTSYNC_PATH = os.path.join(os.path.dirname(HERE), "agentsync",
                               "agentsync_server.py")
 
+# CI checks out the sibling agentsync repo, so the real-integration tests MUST
+# run there. Setting CAMBIUM_REQUIRE_INTEGRATION=1 (the CI does) turns a missing
+# sibling into a hard failure instead of a silent skip — otherwise a broken
+# checkout would vanish that coverage behind a green check. Locally, absent the
+# sibling, these skip cleanly.
+REQUIRE_INTEGRATION = os.environ.get("CAMBIUM_REQUIRE_INTEGRATION") == "1"
+
+
+class SkipTest(Exception):
+    """Raised to skip a test. The runner counts these separately from PASS so a
+    skip is visible, not silently green."""
+
+
+def _need_agentsync(name):
+    """Skip (or, under CAMBIUM_REQUIRE_INTEGRATION, FAIL) when the sibling
+    agentsync repo the real-integration tests drive is not present."""
+    if os.path.exists(AGENTSYNC_PATH):
+        return
+    if REQUIRE_INTEGRATION:
+        raise AssertionError(
+            f"{name}: agentsync sibling repo not found at {AGENTSYNC_PATH}, but "
+            "CAMBIUM_REQUIRE_INTEGRATION=1 requires it (CI checks it out).")
+    raise SkipTest(f"{name} (agentsync repo not found)")
+
 CAMBIUM_ENV = [
     "CAMBIUM_REPO", "CAMBIUM_AGENT_ID", "CAMBIUM_ORG_REPO", "CAMBIUM_ORG_PR",
     "CAMBIUM_PROMOTE_RECALLS", "CAMBIUM_TEAM_BRANCH", "CAMBIUM_AGENTSYNC_BRANCH",
@@ -120,6 +144,19 @@ def unconfigured(root, config_name="empty_config.json"):
     path = os.path.join(root, config_name)
     os.environ["CAMBIUM_CONFIG_FILE"] = path
     return path
+
+
+@contextlib.contextmanager
+def frozen_day(date_str):
+    """Pin M._now() to a fixed UTC day so a test can drive recall credit across
+    distinct (agent, day) marks deterministically (recall credit is deduped per
+    day). Restores the real clock on exit."""
+    orig = M._now
+    M._now = lambda: f"{date_str}T12:00:00+00:00"
+    try:
+        yield
+    finally:
+        M._now = orig
 
 
 def seed_agentsync_branch(clone, claims):
@@ -768,8 +805,16 @@ def test_promote_local_to_team_by_recalls():
         # not eligible yet
         r = json.loads(M.promote())
         assert r["status"] == "none_eligible", r
-        M.recall("ci log parser")
-        M.recall("FORCE_COLOR ci")
+        # recall credit is deduped per (agent, day): sustained use across two
+        # days crosses the threshold-of-2; two recalls on the SAME day would not
+        # (see test_recall_credit_deduped_per_agent_day).
+        with frozen_day("2026-01-01"):
+            M.recall("ci log parser")
+            M.recall("FORCE_COLOR ci")          # same day -> no extra credit
+        r = json.loads(M.promote())
+        assert r["status"] == "none_eligible", r  # still only 1 credit
+        with frozen_day("2026-01-02"):
+            M.recall("ci log parser")           # a second distinct day -> 2
         r = json.loads(M.promote())
         assert r["status"] == "promoted" and r["to"] == "team", r
         # gone from local, visible to ANOTHER collaborator from team scope
@@ -815,6 +860,91 @@ def test_team_recall_tracks_cross_project_usage():
         item = next(i for i in team if i["id"] == item_id)
         assert item["trust"]["recalls"] >= 1, item
         assert "stobie" in item["trust"]["projects"], item
+
+
+def test_recall_credit_deduped_per_agent_day():
+    """Repeated recalls by the same agent on the same day credit trust ONCE;
+    a distinct day credits again. This is what stops a self-recall loop from
+    inflating an item to the promotion threshold."""
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.capture("dedup me", tags="dedup")
+        with frozen_day("2026-03-01"):
+            M.recall("dedup")
+            M.recall("dedup")                       # same agent, same day
+        it = M._read_local(M._cfg())["items"][0]
+        assert it["trust"]["recalls"] == 1, it      # not 2
+        assert it["trust"]["recall_marks"] == ["jonny|2026-03-01"], it
+        with frozen_day("2026-03-02"):
+            M.recall("dedup")                       # a new day -> a new credit
+        it = M._read_local(M._cfg())["items"][0]
+        assert it["trust"]["recalls"] == 2, it
+
+
+# --------------------------------------------------------------------------- #
+# local store durability
+# --------------------------------------------------------------------------- #
+def test_local_store_corruption_is_quarantined_not_lost():
+    """A corrupt/half-written local store is moved aside (recoverable), not
+    silently returned empty and then overwritten — and the next write lands
+    atomically with no temp-file litter."""
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.capture("first fact", tags="a")
+        store = M._cfg()["local_store"]
+        with open(store, "w", encoding="utf-8") as f:
+            f.write('{"items": [ {"id": "k-1", "content": "half')  # truncated
+        # reading must start clean, NOT hand back the corrupt file
+        assert M._read_local(M._cfg())["items"] == []
+        d = os.path.dirname(store)
+        corrupt = [n for n in os.listdir(d)
+                   if n.startswith("knowledge.json.corrupt-")]
+        assert corrupt, os.listdir(d)               # preserved for recovery
+        # a subsequent write succeeds and leaves no .tmp litter behind
+        M.capture("second fact", tags="b")
+        items = M._read_local(M._cfg())["items"]
+        assert any(i["content"] == "second fact" for i in items), items
+        assert not [n for n in os.listdir(d) if n.endswith(".tmp")], os.listdir(d)
+
+
+# --------------------------------------------------------------------------- #
+# deprecate — the retirement action
+# --------------------------------------------------------------------------- #
+def test_deprecate_local_hides_from_recall():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        iid = json.loads(M.capture("billing runs on NetSuite",
+                                   tags="billing"))["item"]["id"]
+        assert json.loads(M.recall("billing NetSuite"))["results"]
+        r = json.loads(M.deprecate(iid, reason="migrated off NetSuite"))
+        assert r["status"] == "deprecated" and r["scope"] == "local", r
+        assert r["item"]["deprecated_reason"] == "migrated off NetSuite", r
+        # gone from recall, but still stored with the stamp (audit trail)
+        assert not json.loads(M.recall("billing NetSuite"))["results"]
+        stored = M._read_local(M._cfg())["items"][0]
+        assert stored["status"] == "deprecated" and stored["deprecated_at"], stored
+
+
+def test_deprecate_reaches_team_scope():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        iid = json.loads(M.capture("team truth to retire",
+                                   tags="t"))["item"]["id"]
+        M.endorse(iid)
+        M.promote()                                 # -> team (removed from local)
+        assert any(i["id"] == iid for i in M._read_team(M._cfg()))
+        r = json.loads(M.deprecate(iid, reason="superseded"))
+        assert r["status"] == "deprecated" and r["scope"] == "team", r
+        team_item = next(i for i in M._read_team(M._cfg()) if i["id"] == iid)
+        assert team_item["status"] == "deprecated", team_item
+        assert not json.loads(M.recall("team truth to retire"))["results"]
+
+
+def test_deprecate_unknown_item_errors():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        r = json.loads(M.deprecate("k-doesnotexist"))
+        assert "error" in r and "No item" in r["error"], r
 
 
 def test_promote_team_to_org_requires_endorsement():
@@ -1223,10 +1353,10 @@ def test_full_compound_growth_loop():
     with lab() as (root, origin, clones):
         org_bare, org_clone = setup_org_repo(root)
         seed_agentsync_branch(clones["stobie"], {"stobie": DONE_CLAIM})
-        be(clones, "jonny", CAMBIUM_ORG_REPO=org_clone, CAMBIUM_PROMOTE_RECALLS="2")
+        be(clones, "jonny", CAMBIUM_ORG_REPO=org_clone, CAMBIUM_PROMOTE_RECALLS="1")
         M.distill()
         M.recall("login JWT")
-        M.recall("argon2 auth")
+        M.recall("argon2 auth")   # same-day dedup -> 1 credit, threshold is 1
         assert json.loads(M.promote())["status"] == "promoted"
         team = M._read_team(M._cfg())
         item_id = next(i["id"] for i in team if "argon2id" in i["content"])
@@ -1312,9 +1442,7 @@ def test_status_overview():
 # integration with the REAL agentsync (skipped if the sibling repo is absent)
 # --------------------------------------------------------------------------- #
 def test_real_agentsync_integration():
-    if not os.path.exists(AGENTSYNC_PATH):
-        print("SKIP  test_real_agentsync_integration (agentsync repo not found)")
-        return
+    _need_agentsync("test_real_agentsync_integration")
     A = load_module("agentsync_server", AGENTSYNC_PATH)
     with lab() as (root, origin, clones):
         # stobie's agent does real work through real agentsync tools
@@ -1340,9 +1468,7 @@ def test_real_agentsync_release_capture():
     """Release-time capture over the REAL agentsync seam: stobie completes work,
     then releases and re-claims through agentsync's own tools; the completion is
     captured once at its transition and never lost or duplicated."""
-    if not os.path.exists(AGENTSYNC_PATH):
-        print("SKIP  test_real_agentsync_release_capture (agentsync repo not found)")
-        return
+    _need_agentsync("test_real_agentsync_release_capture")
     A = load_module("agentsync_server", AGENTSYNC_PATH)
     with lab() as (root, origin, clones):
         def as_stobie():
@@ -1623,6 +1749,11 @@ TESTS = [
     test_endorse_fast_tracks_promotion,
     test_promote_explicit_id_respects_threshold_and_force,
     test_team_recall_tracks_cross_project_usage,
+    test_recall_credit_deduped_per_agent_day,
+    test_local_store_corruption_is_quarantined_not_lost,
+    test_deprecate_local_hides_from_recall,
+    test_deprecate_reaches_team_scope,
+    test_deprecate_unknown_item_errors,
     test_promote_team_to_org_requires_endorsement,
     test_org_promotion_blocks_project_specific_body,
     test_org_promotion_with_org_content_generalizes_and_preserves_example,
@@ -1658,21 +1789,25 @@ TESTS = [
 
 
 def main():
-    failures = 0
+    failures = skipped = 0
     for t in TESTS:
         name = t.__name__
         try:
             t()
             print(f"PASS  {name}")
+        except SkipTest as e:
+            skipped += 1
+            print(f"SKIP  {name}: {e}")
         except Exception as e:  # noqa: BLE001 - test runner
             failures += 1
             traceback.print_exc()
             print(f"FAIL  {name}: {e}")
     print()
+    tail = f" ({skipped} skipped)" if skipped else ""
     if failures:
-        print(f"{failures}/{len(TESTS)} FAILED")
+        print(f"{failures}/{len(TESTS)} FAILED{tail}")
         sys.exit(1)
-    print(f"ALL {len(TESTS)} TESTS PASS")
+    print(f"ALL {len(TESTS) - skipped} TESTS PASS{tail}")
 
 
 if __name__ == "__main__":

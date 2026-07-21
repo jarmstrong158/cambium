@@ -57,6 +57,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -370,6 +371,40 @@ def _empty_local():
                          "agentsync_last": {}, "import": []}}
 
 
+def _atomic_write_json(path, data):
+    """Write JSON to `path` atomically: dump to a temp file in the same dir,
+    fsync, then os.replace (an atomic rename on every platform). A crash mid-
+    write leaves the original intact instead of a half-written, unparseable file
+    — which, combined with the quarantine in _read_local, is what keeps the
+    local store from silently vanishing."""
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".knowledge-", suffix=".tmp", dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _quarantine_corrupt(path):
+    """Move an unparseable local store aside (…knowledge.json.corrupt-<epoch>)
+    instead of letting the next write silently overwrite it with an empty store.
+    The local store is the one tier NOT backed by git, so a corrupt file is the
+    only copy — preserve it for hand-recovery. Best-effort; never raises."""
+    try:
+        os.replace(path, "%s.corrupt-%d" % (path, int(time.time())))
+    except OSError:
+        pass
+
+
 def _read_local(cfg):
     path = cfg["local_store"]
     if not os.path.exists(path):
@@ -377,7 +412,16 @@ def _read_local(cfg):
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, json.JSONDecodeError):
+    except OSError:
+        return _empty_local()
+    except json.JSONDecodeError:
+        # Corrupt/partial store. Returning empty here (the old behaviour) meant
+        # the next write overwrote the only copy — total silent loss. Quarantine
+        # it first so it is recoverable, THEN start clean.
+        _quarantine_corrupt(path)
+        return _empty_local()
+    if not isinstance(data, dict):
+        _quarantine_corrupt(path)
         return _empty_local()
     data.setdefault("items", [])
     data.setdefault("imported", {})
@@ -389,9 +433,7 @@ def _read_local(cfg):
 
 
 def _write_local(cfg, data):
-    os.makedirs(os.path.dirname(cfg["local_store"]), exist_ok=True)
-    with open(cfg["local_store"], "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    _atomic_write_json(cfg["local_store"], data)
 
 
 # --------------------------------------------------------------------------- #
@@ -848,6 +890,29 @@ def _eligible_team(cfg, item):
 
 def _eligible_org(item):
     return len(item.get("trust", {}).get("endorsements", [])) >= 1
+
+
+def _recall_mark(cfg):
+    """The dedup key for one recall credit: this agent, this UTC day. Recall
+    counts feed promotion (3 recalls auto-qualifies local->team), so crediting
+    every raw recall let one agent loop the same query and promote its own item.
+    Crediting at most once per (agent, day) keeps 'usage promotes' honest — it
+    now means sustained use across days, or use by distinct teammates."""
+    return "%s|%s" % (cfg["agent"], _now()[:10])
+
+
+def _credit_recall(item, mark):
+    """Record one recall credit against an item unless this (agent, day) mark is
+    already counted. Returns True if it was newly credited. Legacy items have a
+    `recalls` count but no `recall_marks`; the first new credit starts the ledger
+    without discarding the prior count."""
+    trust = item.setdefault("trust", {})
+    marks = trust.setdefault("recall_marks", [])
+    if mark in marks:
+        return False
+    marks.append(mark)
+    trust["recalls"] = trust.get("recalls", 0) + 1
+    return True
 
 
 def _distinct_identities(cfg):
@@ -1493,11 +1558,14 @@ def recall(query: str, scope: str = "auto", limit: int = 5) -> str:
 
     pool = []
     local_data = None
+    team_by_id = {}
     if "local" in scopes:
         local_data = _read_local(cfg)
         pool += [("local", i) for i in local_data["items"]]
     if "team" in scopes:
-        pool += [("team", i) for i in _read_team(cfg)]
+        for i in _read_team(cfg):
+            team_by_id[i["id"]] = i
+            pool.append(("team", i))
     if "org" in scopes:
         pool += [("org", i) for i in _read_org(cfg)]
 
@@ -1507,32 +1575,50 @@ def recall(query: str, scope: str = "auto", limit: int = 5) -> str:
     scored.sort(key=lambda t: t[1], reverse=True)
     top = [t for t in scored[:limit] if t[1] > 0]
 
-    # usage tracking — best-effort, never fails the recall
+    # usage tracking — best-effort, never fails the recall. Credit is deduped
+    # per (agent, day) so a repeat recall neither inflates trust nor triggers a
+    # write; that dedup is also what lets us skip the team git-push entirely when
+    # nothing new would be recorded (see _recall_mark / _credit_recall).
+    mark = _recall_mark(cfg)
     hit_local = {i["id"] for s, _, i in top if s == "local"}
     hit_team = {i["id"] for s, _, i in top if s == "team"}
     if hit_local and local_data is not None:
+        changed = False
         for i in local_data["items"]:
-            if i["id"] in hit_local:
-                i["trust"]["recalls"] += 1
+            if i["id"] in hit_local and _credit_recall(i, mark):
                 i["updated_at"] = _now()
-        _write_local(cfg, local_data)
+                changed = True
+        if changed:
+            _write_local(cfg, local_data)
     if hit_team:
-        def bump(data):
-            changed = False
-            for i in data["items"]:
-                if i["id"] in hit_team:
-                    i.setdefault("trust", {}).setdefault("recalls", 0)
-                    i["trust"]["recalls"] += 1
-                    projs = i["trust"].setdefault("projects", [])
-                    if cfg["project"] not in projs:
+        # Pre-check against the copies already read into the pool: only touch the
+        # shared branch (a network fetch + commit + push) if some team hit has a
+        # new credit or a new project to record. An already-credited recall is a
+        # pure read.
+        def _needs_write(i):
+            t = i.get("trust", {})
+            return (mark not in t.get("recall_marks", [])
+                    or cfg["project"] not in t.get("projects", []))
+        if any(_needs_write(team_by_id[iid]) for iid in hit_team
+               if iid in team_by_id):
+            def bump(data):
+                changed = False
+                for i in data["items"]:
+                    if i["id"] not in hit_team:
+                        continue
+                    credited = _credit_recall(i, mark)
+                    projs = i.setdefault("trust", {}).setdefault("projects", [])
+                    new_proj = cfg["project"] not in projs
+                    if new_proj:
                         projs.append(cfg["project"])  # cross-project signal
-                    i["updated_at"] = _now()
-                    changed = True
-            return None if changed else False
-        try:
-            _team_mutate(cfg, bump, f"cambium: usage by {cfg['agent']}")
-        except Exception:
-            pass  # tracking must never break recall
+                    if credited or new_proj:
+                        i["updated_at"] = _now()
+                        changed = True
+                return None if changed else False
+            try:
+                _team_mutate(cfg, bump, f"cambium: usage by {cfg['agent']}")
+            except Exception:
+                pass  # tracking must never break recall
 
     results = [
         {"scope": s, "relevance": round(sc, 3), **{
@@ -1632,6 +1718,83 @@ def verify_entry(item_id: str, note: str = "") -> str:
     if not ok:
         return json.dumps({"status": "retry_exhausted"})
     return json.dumps({"error": f"No item '{item_id}' in local or team scope."})
+
+
+@mcp.tool()
+def deprecate(item_id: str, reason: str = "") -> str:
+    """Retire a knowledge item so recall stops serving it — the counterpart to
+    verify_entry (which re-affirms). This is the action stale_report points at:
+    when an entry's premise has died ("we've left NetSuite"), deprecate it.
+
+    Sets status='deprecated' wherever the item lives — local, team, or org —
+    through the same write/CAS path promotion uses (org honours CAMBIUM_ORG_PR,
+    landing the change as a pull request). Deprecated items drop out of recall(),
+    KNOWLEDGE.md, and promotion, but stay in the store with a `deprecated_at`
+    stamp and optional reason for provenance/audit; reactivating one is a manual
+    JSON edit by design (retiring is the common, safe direction)."""
+    cfg, err = _require_cfg()
+    if err:
+        return err
+    when = _now()
+
+    def _retire(i):
+        i["status"] = "deprecated"
+        i["deprecated_at"] = when
+        i["deprecated_by"] = cfg["agent"]
+        if reason.strip():
+            i["deprecated_reason"] = _demojibake(reason.strip())
+        i["updated_at"] = when
+
+    # local
+    data = _read_local(cfg)
+    for i in data["items"]:
+        if i["id"] == item_id:
+            _retire(i)
+            _write_local(cfg, data)
+            return json.dumps({"status": "deprecated", "scope": "local",
+                               "item": i}, indent=2)
+
+    # team
+    found = {}
+    def mark_team(team_data):
+        for i in team_data["items"]:
+            if i["id"] == item_id:
+                _retire(i)
+                found["item"] = i
+                return None
+        return False
+    ok = _team_mutate(cfg, mark_team,
+                      f"cambium: {cfg['agent']} deprecates {item_id}")
+    if found.get("item"):
+        return json.dumps({"status": "deprecated", "scope": "team",
+                           "item": found["item"]}, indent=2)
+    if not ok:
+        return json.dumps({"status": "retry_exhausted"})
+
+    # org
+    if cfg["org_repo"] and any(i["id"] == item_id for i in _read_org(cfg)):
+        def mark_org(org_data):
+            for i in org_data["items"]:
+                if i["id"] == item_id:
+                    _retire(i)
+                    return None
+            return False
+        msg = f"cambium: deprecate {item_id}"
+        if cfg["org_pr"]:
+            ok2, detail, url = _org_mutate_pr(cfg, mark_org, msg)
+            if not ok2:
+                return json.dumps({"status": "failed", "detail": detail})
+            return json.dumps({"status": "deprecated", "scope": "org",
+                               "via": "pr", "pr_url": url, "detail": detail},
+                              indent=2)
+        ok2, detail = _org_mutate_direct(cfg, mark_org, msg)
+        if not ok2:
+            return json.dumps({"status": "failed", "detail": detail})
+        return json.dumps({"status": "deprecated", "scope": "org",
+                           "via": "direct", "detail": detail}, indent=2)
+
+    return json.dumps({"error": f"No item '{item_id}' in local, team, or org "
+                       "scope."})
 
 
 @mcp.tool()
