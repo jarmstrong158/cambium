@@ -274,5 +274,34 @@
     "created_at": "2026-07-21T12:56:35.743780+00:00",
     "updated_at": "2026-07-21T12:56:35.743780+00:00",
     "verified_at": "2026-07-21T12:56:35.743780+00:00"
+  },
+  {
+    "id": "dec-010-407a",
+    "summary": "Add a read-only session_primer() tool that returns a compact digest of the current project's highest-value knowledge, for automatic injection at SessionStart via a new xylem hook \u2014 making recall passive instead of an advisory step an agent has to remember.",
+    "problem": "The stack's recall discipline was advisory prose only: SessionStart injected a context-keeper summary but nothing ran cambium, so an agent had to remember to call recall() \u2014 and at this session's start it didn't, so cambium was ignored. Capture (SessionEnd distill) is automated; recall was not. The loop was half-open.",
+    "why_chosen": "A dedicated primer (top active items by recalls then recency across local/team/org, plus stale valid_while assumptions) is what a hook can inject cheaply at session start. It is READ-ONLY \u2014 unlike recall() it does NOT increment recall counts \u2014 because a passive session-start surfacing must not inflate trust or trigger promotion. The hook (in xylem) resolves the session's real project from the SessionStart payload cwd and points cambium's config file at it, so the per-call-resolving cambium server follows the session project; this is the only one of the three servers that can follow mid-life (context-keeper/agentsync resolve once at startup and need a separate per-call change).",
+    "what_we_tried": "",
+    "tradeoffs": "Primer reads all scopes each session start (a couple of git fetches); acceptable for a once-per-session hook. It ranks by recalls+recency, not query relevance, since there is no query at session start.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [
+      "dec-008-7aa6"
+    ],
+    "tags": [
+      "cambium",
+      "primer",
+      "recall",
+      "hook",
+      "automation",
+      "xylem"
+    ],
+    "retrieval_hints": [],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-21T13:50:06.074801+00:00",
+    "updated_at": "2026-07-21T13:50:06.074801+00:00",
+    "verified_at": "2026-07-21T13:50:06.074801+00:00"
   }
 ]

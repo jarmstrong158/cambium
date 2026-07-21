@@ -2381,6 +2381,66 @@ def setup(project_repo: str, agent_id: str, org_repo: str = "",
     return json.dumps(result, indent=2)
 
 
+@mcp.tool()
+def session_primer(limit: int = 8) -> str:
+    """A compact digest of what's ALREADY known for this project — built to be
+    injected automatically at session start so recall is passive, not a step an
+    agent has to remember. Returns the highest-value active knowledge (most-
+    recalled, then most-recently-updated) across local+team+org, plus any promoted
+    assumptions (valid_while premises) that look stale and worth re-checking.
+
+    READ-ONLY: unlike recall(), it does NOT increment recall counters — a passive
+    session-start surfacing must never inflate trust or nudge promotion. It is the
+    session-start counterpart to distill() at session end: together they close the
+    capture/recall loop without either one depending on the agent remembering to
+    call it. Use recall(query) for a real, query-scoped search."""
+    cfg, err = _require_cfg()
+    if err:
+        return err
+    limit = max(1, min(int(limit), 25))
+
+    local_items = _read_local(cfg)["items"]
+    pool = [("local", i) for i in local_items]
+    try:
+        pool += [("team", i) for i in _read_team(cfg)]
+        if cfg["org_repo"]:
+            pool += [("org", i) for i in _read_org(cfg)]
+    except Exception:
+        pass  # a primer is best-effort; a missing remote scope never fails it
+    active = [(s, i) for s, i in pool if i.get("status") == "active"]
+
+    # rank by recalls desc, then most-recent — the cheapest "what mattered" signal
+    top = sorted(
+        active,
+        key=lambda si: (si[1].get("trust", {}).get("recalls", 0),
+                        si[1].get("updated_at", "")),
+        reverse=True)[:limit]
+
+    # promoted assumptions whose premise may have died, oldest-verified first
+    premises = [(s, i) for s, i in active if (i.get("valid_while") or "").strip()]
+    premises.sort(key=lambda si: _verified_key(si[1]))
+
+    digest = {
+        "project": cfg["project"],
+        "known_items": len(active),
+        "known": [{"scope": s, "kind": i.get("kind", "note"),
+                   "content": _oneline(i.get("content", ""))[:160],
+                   "recalls": i.get("trust", {}).get("recalls", 0)}
+                  for s, i in top],
+        "check_assumptions": [
+            {"content": _oneline(i.get("content", ""))[:100],
+             "valid_while": _oneline(i.get("valid_while", "")),
+             "last_verified": i.get("last_verified")}
+            for s, i in premises[:3]],
+        "how_to_use": ("recall(<query>) to search deeper; this primer is "
+                       "read-only and did not count as a recall."),
+    }
+    if not active:
+        digest["note"] = ("No cambium knowledge for this project yet — it will "
+                          "accumulate as distill() runs at session end.")
+    return json.dumps(digest, indent=2)
+
+
 def main():
     """Console entry point (pip install cambium-mcp -> `cambium-mcp`)."""
     mcp.run()

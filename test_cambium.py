@@ -959,6 +959,47 @@ def test_deprecate_unknown_item_errors():
         assert "error" in r and "No item" in r["error"], r
 
 
+# --------------------------------------------------------------------------- #
+# session_primer — passive recall at session start
+# --------------------------------------------------------------------------- #
+def test_session_primer_ranks_and_is_read_only():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.capture("rarely used note", tags="a")
+        b = json.loads(M.capture("hot note about deploys",
+                                 tags="deploy"))["item"]["id"]
+        with frozen_day("2026-05-01"):
+            M.recall("deploys")
+        with frozen_day("2026-05-02"):
+            M.recall("deploys")           # b now has 2 recall credits, a has 0
+        before = next(i for i in M._read_local(M._cfg())["items"]
+                      if i["id"] == b)["trust"]["recalls"]
+        p = json.loads(M.session_primer())
+        assert p["known"], p
+        assert p["known"][0]["content"].startswith("hot note"), p   # ranked first
+        # READ-ONLY: the primer must not increment recall counters
+        after = next(i for i in M._read_local(M._cfg())["items"]
+                     if i["id"] == b)["trust"]["recalls"]
+        assert after == before, (before, after)
+
+
+def test_session_primer_surfaces_stale_assumptions():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        M.capture("billing runs on NetSuite", tags="billing",
+                  valid_while="while we're on NetSuite")
+        p = json.loads(M.session_primer())
+        assert any("NetSuite" in c["valid_while"]
+                   for c in p["check_assumptions"]), p
+
+
+def test_session_primer_empty_project():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        p = json.loads(M.session_primer())
+        assert p["known"] == [] and p["known_items"] == 0 and "note" in p, p
+
+
 def test_promote_team_to_org_requires_endorsement():
     with lab() as (root, origin, clones):
         org_bare, org_clone = setup_org_repo(root)
@@ -1767,6 +1808,9 @@ TESTS = [
     test_deprecate_local_hides_from_recall,
     test_deprecate_reaches_team_scope,
     test_deprecate_unknown_item_errors,
+    test_session_primer_ranks_and_is_read_only,
+    test_session_primer_surfaces_stale_assumptions,
+    test_session_primer_empty_project,
     test_promote_team_to_org_requires_endorsement,
     test_org_promotion_blocks_project_specific_body,
     test_org_promotion_with_org_content_generalizes_and_preserves_example,
