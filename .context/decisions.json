@@ -246,5 +246,33 @@
     "created_at": "2026-07-21T12:14:59.394763+00:00",
     "updated_at": "2026-07-21T12:14:59.394763+00:00",
     "verified_at": "2026-07-21T12:14:59.394763+00:00"
+  },
+  {
+    "id": "dec-009-b97e",
+    "summary": "_score's >=3-char substring match is now prefix-based (w.startswith(tok) or tok.startswith(w)) instead of bare bidirectional infix (tok in w or w in tok), removing false positives like \"art\"~\"start\" while keeping stem/plural matches like hash~hashing.",
+    "problem": "The lexical scorer credited a query token >=3 chars if it appeared ANYWHERE inside a stored body word (or vice versa). That let unrelated short tokens score hits (\"art\" in \"start\", \"cat\" in \"locate\"), which both added recall noise and \u2014 because recall counts feed promotion \u2014 inflated the trust of items that had nothing to do with the query. Flagged in the audit as the precision half of the recall-integrity work; deferred because changing scoring needed measurement.",
+    "why_chosen": "The intended matches the docstring cites (jwt~jwts, hash~hashing) are all shared-prefix relationships; the false positives are infix/suffix. Requiring one token to be a prefix of the other keeps every intended stem/plural match and drops the spurious ones, with no new dependency. Validated with bench_recall.py against the real org knowledge.json: control top-1 8/9 and paraphrase top-1 8/9 (89%) both unchanged, 0 gold items below the relevance floor before and after; only min-gold moved 0.50->0.40 (a gold item losing a self-inflating infix hit while still ranked #1). So precision improved with recall provably unchanged.",
+    "what_we_tried": "",
+    "tradeoffs": "Prefix matching still allows some loose stems (e.g. \"cat\"~\"category\"); tightening further (true stemming) would need a dependency or a stopword/affix list and wasn't justified by the benchmark. bench_recall is still not wired into CI (needs the org fixture); a self-contained _score precision unit test covers the regression in CI instead.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [
+      "dec-008-7aa6"
+    ],
+    "tags": [
+      "cambium",
+      "recall",
+      "score",
+      "precision",
+      "bench"
+    ],
+    "retrieval_hints": [],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-21T12:56:35.743780+00:00",
+    "updated_at": "2026-07-21T12:56:35.743780+00:00",
+    "verified_at": "2026-07-21T12:56:35.743780+00:00"
   }
 ]
