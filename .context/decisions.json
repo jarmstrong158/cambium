@@ -219,5 +219,32 @@
     "created_at": "2026-07-14T23:39:14.260479+00:00",
     "updated_at": "2026-07-14T23:39:14.260479+00:00",
     "verified_at": "2026-07-14T23:39:14.260479+00:00"
+  },
+  {
+    "id": "dec-008-7aa6",
+    "summary": "Three integrity fixes: (1) local store writes are atomic + corrupt files are quarantined not silently emptied; (2) recall credit is deduped per (agent, UTC day) so a self-recall loop can't inflate trust into promotion; (3) a new deprecate() tool retires items across local/team/org through existing CAS paths.",
+    "problem": "Audit of cambium found three unguarded gaps not covered by DESIGN/README: _write_local was non-atomic and _read_local returned an empty store on any JSON parse error, so a crash mid-write or one corrupt byte silently destroyed all local (non-git-backed) knowledge on the next write. recall() incremented trust.recalls with no per-agent dedup and 3 recalls auto-qualifies local->team, so one agent looping the same query promotes its own item. And there was no tool to retire wrong/stale knowledge (deprecation was hand-editing JSON), despite stale_report surfacing stale items and the README worrying about wrong knowledge getting institutionalized.",
+    "why_chosen": "Atomic temp+os.replace with a corrupt-file quarantine turns a silent-total-loss into a recoverable file, and only local needs it (team/org are git-recoverable). Deduping recall credit by (agent, UTC day) kills the trivial self-inflation loop while preserving 'usage promotes' for sustained real use across days or teammates; it also lets recall SKIP the team CAS git-push when there's nothing new to credit, cheapening the hot path without redesigning the push. deprecate() routes through the same local/_team_mutate/_org_mutate paths promotion uses and sets status=deprecated, which recall/export/promotion already filter out - completing the lifecycle stale_report points at. Deliberately did NOT touch _score's substring matching (it feeds bench_recall and needs measurement) or redesign the recall git-push mechanism (owner asked to explain-before-changing that).",
+    "what_we_tried": "",
+    "tradeoffs": "A purely-local item (only ever recalled by its owner) now needs multi-day use OR an endorsement to promote by recalls, not N recalls in one session. recall_marks grows per (agent,day) on each item (bounded, trimmable later). deprecate is retire-only; reactivation stays a manual JSON edit.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [],
+    "tags": [
+      "cambium",
+      "durability",
+      "trust-model",
+      "recall",
+      "deprecate",
+      "atomic-write"
+    ],
+    "retrieval_hints": [],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-07-21T12:14:59.394763+00:00",
+    "updated_at": "2026-07-21T12:14:59.394763+00:00",
+    "verified_at": "2026-07-21T12:14:59.394763+00:00"
   }
 ]
