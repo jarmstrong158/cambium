@@ -32,4 +32,9 @@ jobs:
           git config --global init.defaultBranch main
 
       - name: Run test suite
+        # CI checks out the sibling agentsync above, so the real-integration
+        # tests MUST run here — require them so a broken checkout fails loudly
+        # instead of skipping behind a green check.
+        env:
+          CAMBIUM_REQUIRE_INTEGRATION: "1"
         run: python cambium/test_cambium.py
