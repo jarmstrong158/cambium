@@ -123,7 +123,7 @@ class ConfigError(RuntimeError):
 _CONFIG_KEYS = ("CAMBIUM_REPO", "CAMBIUM_AGENT_ID", "CAMBIUM_ORG_REPO",
                 "CAMBIUM_TEAM_BRANCH", "CAMBIUM_ORG_PR", "CAMBIUM_RELEASE_CAPTURE",
                 "CAMBIUM_PROMOTE_RECALLS", "CAMBIUM_REMOTE",
-                "CAMBIUM_AGENTSYNC_BRANCH")
+                "CAMBIUM_AGENTSYNC_BRANCH", "AGENTSYNC_BOARD_REPO")
 
 
 def _config_file():
@@ -347,6 +347,67 @@ def _gh(args, cwd=None, check=True):
 def _remote_has_branch(repo, remote, branch):
     p = _git(["ls-remote", "--heads", remote, branch], repo, check=False)
     return bool(p.stdout.strip())
+
+
+def _repo_has_board(repo, remote, branch):
+    """True if `repo` actually holds an agentsync coordination branch — as a
+    local head, a remote-tracking ref, or on the remote itself. Cheap local ref
+    checks first; the network ls-remote is a last resort.
+
+    MIRRORS agentsync.repo_has_board. If you change one, change both."""
+    if not repo or not os.path.isdir(os.path.join(repo, ".git")):
+        return False
+    for ref in (f"refs/heads/{branch}", f"refs/remotes/{remote}/{branch}"):
+        p = _git(["rev-parse", "--verify", "--quiet", ref], repo, check=False)
+        if p.returncode == 0 and p.stdout.strip():
+            return True
+    try:
+        p = _git(["ls-remote", "--heads", remote, branch], repo, check=False)
+    except RuntimeError:
+        return False
+    return p.returncode == 0 and bool(p.stdout.strip())
+
+
+def _resolve_board_repo(cfg):
+    """Where the agentsync coordination board lives, resolved INDEPENDENTLY of
+    the session pointer and identically to agentsync itself.
+
+    Returns (repo, source, problem). `problem` is None when a board was found,
+    otherwise a plain-language explanation that callers must surface — never
+    swallow. Unlike agentsync this does not raise: distill has a second
+    substrate (context-keeper) and must still do that half of its job.
+
+    Order (mirrors agentsync._resolve_board_repo):
+      1. AGENTSYNC_BOARD_REPO  — the explicit, shared board address. One
+         setting configures both servers, which is the point: cambium and
+         agentsync can no longer disagree about where the board is.
+      2. AGENTSYNC_REPO        — agentsync's legacy explicit pin.
+      3. cfg["repo"], but ONLY if it actually holds the coordination branch.
+      4. no board — reported loudly."""
+    file_cfg = _load_config_file()
+    remote, branch = cfg["remote"], cfg["agentsync_branch"]
+    for name in ("AGENTSYNC_BOARD_REPO", "AGENTSYNC_REPO"):
+        v = _resolve(name, file_cfg)
+        if v:
+            p = _abspath(v)
+            if not os.path.isdir(os.path.join(p, ".git")):
+                return p, name, (
+                    f"{name} points at {p}, which is not a git repository — "
+                    "no agentsync claims can be read from it")
+            if not _repo_has_board(p, remote, branch):
+                return p, name, (
+                    f"{name} points at {p}, which has no '{branch}' branch on "
+                    f"'{remote}' — it is not a board")
+            return p, name, None
+
+    repo = cfg["repo"]
+    if _repo_has_board(repo, remote, branch):
+        return repo, "current-repo", None
+    return repo, "current-repo", (
+        "AGENTSYNC_BOARD_REPO is not set, and the current project "
+        f"({repo}) has no '{branch}' coordination branch on '{remote}'. The "
+        "board is a shared, long-lived artifact — it does not follow whichever "
+        "project this session happens to be in.")
 
 
 def _default_remote_head(repo, remote):
@@ -1004,7 +1065,12 @@ def _distinct_identities(cfg):
     if cfg.get("agent"):
         ids.add(cfg["agent"])
     try:
-        repo, remote, br = cfg["repo"], cfg["remote"], cfg["agentsync_branch"]
+        # Same board resolution distill uses — a solo/team judgement made from
+        # the wrong (or a missing) board is the same failure in a new costume.
+        remote, br = cfg["remote"], cfg["agentsync_branch"]
+        repo, _src, problem = _resolve_board_repo(cfg)
+        if problem:
+            raise RuntimeError(problem)
         _git(["fetch", remote, br], repo, check=False)
         claims = _show_file(repo, f"{remote}/{br}", "claims.json")
         if isinstance(claims, dict):
@@ -1197,7 +1263,7 @@ def _agentsync_item(cfg, agent, claim):
     key = _agentsync_key(agent, task, branch, note)
     files = [c.get("path") for c in (claim.get("changed_files") or [])
              if isinstance(c, dict) and c.get("path")]
-    verb = "finished" if claim.get("status") == "done" else "released"
+    verb = "finished" if _claim_is_done(claim) else "released"
     content = f"[{agent}] {verb} '{task}'"
     if note:
         content += f": {note}"
@@ -1232,6 +1298,24 @@ def _capture_claim(data, imported_as, new_items, item, key):
     same claim caught at release time and again in a later full distill never
     double-imports."""
     _ingest(data, "agentsync", imported_as, new_items, item, key)
+
+
+_DONE_STATUS = re.compile(r"^done\b", re.IGNORECASE)
+
+
+def _claim_is_done(claim):
+    """True if an agentsync claim reports itself finished.
+
+    agentsync's own update_status() only writes the exact literal "done", but
+    claims.json is a foreign substrate cambium does not own: agentsync-remote,
+    a hand edit, or a human writing a closing note in the status field all
+    produce things like "DONE - shipped to origin/main as 56052d8". An exact ==
+    "done" test silently skipped those, which looks identical to "nothing has
+    finished yet". Anchored at the start and word-bounded, so "not done" and
+    "done-ish"-style continuations of another word are not matched."""
+    if not isinstance(claim, dict):
+        return False
+    return bool(_DONE_STATUS.match(str(claim.get("status") or "").strip()))
 
 
 def _claim_ident(claim):
@@ -1440,25 +1524,74 @@ def distill() -> str:
     new_items = []
 
     # --- source 1: agentsync coordination branch -------------------------- #
-    repo, remote = cfg["repo"], cfg["remote"]
+    remote = cfg["remote"]
     as_branch = cfg["agentsync_branch"]
-    agentsync_seen = False
     released_captured = 0
     verification_prompt = []
-    _git(["fetch", remote, as_branch], repo, check=False)
-    claims_doc = _show_file(repo, f"{remote}/{as_branch}", "claims.json")
-    if isinstance(claims_doc, dict):
-        agentsync_seen = True
+    warnings = []
+    # The board is addressed independently of the session pointer, by the same
+    # rules agentsync uses. Previously this read cfg["repo"] and reported a
+    # miss as the bland, ignorable string "no coordination branch found".
+    repo, board_source, board_problem = _resolve_board_repo(cfg)
+    agentsync_report = {
+        "status": "skipped",
+        "board_repo": repo,
+        "board_source": board_source,
+        "branch": as_branch,
+        "imported": 0,
+    }
+    claims_doc = None
+    if board_problem is None:
+        _git(["fetch", remote, as_branch], repo, check=False)
+        claims_doc = _show_file(repo, f"{remote}/{as_branch}", "claims.json")
+        if not isinstance(claims_doc, dict):
+            board_problem = (
+                f"the '{as_branch}' branch exists in {repo} but its claims.json "
+                "is missing or unparseable, so no claims could be read")
+            claims_doc = None
+
+    if board_problem is not None:
+        agentsync_report["reason"] = board_problem
+        agentsync_report["fix"] = (
+            "Set AGENTSYNC_BOARD_REPO (env, or via setup()) to the absolute "
+            "path of the clone holding the agentsync coordination branch. "
+            "agentsync resolves the board the same way, so one setting fixes "
+            "both.")
+        # A SKIPPED STEP MUST NOT LOOK LIKE A COMPLETED ONE. This is the whole
+        # lesson of this codebase: the old return said
+        # "agentsync": "no coordination branch found" and every caller read it
+        # as normal, so distill imported zero agentsync claims for its entire
+        # lifetime without anyone noticing.
+        warnings.append(
+            "agentsync source SKIPPED — no claims were distilled. "
+            + board_problem + " " + agentsync_report["fix"])
+
+    claims_now = {}
+    if claims_doc is not None:
+        agentsync_report["status"] = "read"
         claims_now = claims_doc.get("claims", {})
         if not isinstance(claims_now, dict):
             claims_now = {}
+        agentsync_report["claims_seen"] = len(claims_now)
+        agentsync_report["done_claims"] = sum(
+            1 for c in claims_now.values() if _claim_is_done(c))
 
+    if claims_doc is not None:
         # (1) live done claims — the classic full-distill pass.
         for agent, claim in claims_now.items():
-            if not isinstance(claim, dict) or claim.get("status") != "done":
+            if not isinstance(claim, dict) or not _claim_is_done(claim):
                 continue
             item, key = _agentsync_item(cfg, agent, claim)
             _capture_claim(data, imported_as, new_items, item, key)
+        if agentsync_report.get("claims_seen") and not agentsync_report[
+                "done_claims"]:
+            # Read successfully, but nothing was finished. Say so — an empty
+            # import from a live board and an import from no board at all are
+            # very different facts.
+            warnings.append(
+                f"agentsync board read ({agentsync_report['claims_seen']} "
+                "claim(s)) but none are done, so nothing was distilled from it. "
+                "Claims become knowledge when they reach status 'done'.")
 
         # (2) release-time capture (opt-in). agentsync exposes no hook or event:
         # a claim marked done then released/re-claimed before a distill runs is
@@ -1475,7 +1608,7 @@ def distill() -> str:
                 # Only knowledge-bearing completions become memory: a done claim,
                 # or one carrying a reconciliation note. A never-noted abandoned
                 # claim holds nothing to distill.
-                if prev.get("status") != "done" and not (prev.get("note") or ""):
+                if not _claim_is_done(prev) and not (prev.get("note") or ""):
                     continue
                 item, key = _agentsync_item(cfg, agent, prev)
                 before = len(new_items)
@@ -1486,6 +1619,7 @@ def distill() -> str:
                 a: _claim_snapshot(c) for a, c in claims_now.items()
                 if isinstance(c, dict)
             }
+        agentsync_report["imported"] = len(new_items)
 
     # Lifecycle hook: at the release moment, nudge re-verification of the
     # oldest-verified promoted entries relevant to what just completed. new_items
@@ -1583,10 +1717,25 @@ def distill() -> str:
         except Exception:
             pass  # best-effort; a missing remote scope never fails a distill
 
+    if not ck_seen:
+        warnings.append(
+            "context-keeper source SKIPPED — no readable .context/ store at "
+            f"{cfg['context_dir']}, so no decisions or constraints were "
+            "distilled.")
+
     _write_local(cfg, data)
+    ck_report = {
+        "status": "read" if ck_seen else "skipped",
+        "context_dir": cfg["context_dir"],
+    }
+    if not ck_seen:
+        ck_report["reason"] = "no readable decisions.json/constraints.json found"
     return json.dumps(
         {
-            "status": "distilled",
+            # A skipped substrate must not be reportable as a completed one.
+            # Callers that only look at `status` still see the difference.
+            "status": "distilled_with_warnings" if warnings else "distilled",
+            "warnings": warnings,
             "new_items": len(new_items),
             "released_captured": released_captured,
             "release_capture": cfg["release_capture"],
@@ -1594,8 +1743,8 @@ def distill() -> str:
             "stale_promoted": stale_promoted,
             "verification_prompt": verification_prompt,
             "sources": {
-                "agentsync": "read" if agentsync_seen else "no coordination branch found",
-                "context_keeper": "read" if ck_seen else "no .context/ store found",
+                "agentsync": agentsync_report,
+                "context_keeper": ck_report,
             },
             "items": [{"id": i["id"], "kind": i["kind"], "content": i["content"]}
                       for i in new_items],
@@ -2376,6 +2525,12 @@ def status() -> str:
             by_type[i.get("type", "?")] = by_type.get(i.get("type", "?"), 0) + 1
         return {"total": len(items), "by_type": by_type}
 
+    board_repo, board_source, board_problem = _resolve_board_repo(cfg)
+    board_state = {"repo": board_repo, "source": board_source,
+                   "found": board_problem is None}
+    if board_problem:
+        board_state["problem"] = board_problem
+
     state.update({
         "mode": _detect_mode(cfg),
         "scopes": {"local": count(local["items"]), "team": count(team),
@@ -2385,6 +2540,10 @@ def status() -> str:
                      "import": len(local["imported"]["import"])},
         "substrates": {
             "agentsync_branch": cfg["agentsync_branch"],
+            # Which board distill will actually read, and whether it exists.
+            # Reporting only the branch NAME hid the fact that no repo in
+            # scope had that branch at all.
+            "agentsync_board": board_state,
             "context_dir": os.path.isdir(cfg["context_dir"]),
             "team_branch": cfg["team_branch"],
             "org_repo": cfg["org_repo"] or None,

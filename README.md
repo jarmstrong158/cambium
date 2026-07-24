@@ -98,12 +98,49 @@ overrides the config file per-key — the table is the full reference layer:
 | `CAMBIUM_REMOTE` | no | `origin` | git remote |
 | `CAMBIUM_GIT_TIMEOUT` | no | `25` | per-invocation git/gh timeout (seconds) so a stuck call fails fast instead of hanging the server |
 | `CAMBIUM_TEAM_BRANCH` | no | `cambium` | team-scope branch |
-| `CAMBIUM_AGENTSYNC_BRANCH` | no | `agentsync` | where distill reads coordination events |
+| `CAMBIUM_AGENTSYNC_BRANCH` | no | `agentsync` | coordination branch name distill reads |
+| `AGENTSYNC_BOARD_REPO` | no\* | — | **which repo holds the board** — the same setting agentsync reads, so the two servers cannot disagree (see below) |
 | `CAMBIUM_ORG_REPO` | no | — | path to the org knowledge repo clone (org scope off without it) |
 | `CAMBIUM_ORG_PR` | no | direct push | `1` = org promotion opens a pull request |
 | `CAMBIUM_PROMOTE_RECALLS` | no | `3` | recalls needed for local→team |
 | `CAMBIUM_RELEASE_CAPTURE` | no | off | `1` = also capture agentsync claims at their done/released transition (see below) |
 | `CAMBIUM_CONFIG_FILE` | no | `~/.cambium/config.json` | override the fallback config path (mainly for tests) |
+
+### Where the agentsync board lives (board addressing)
+
+\* `distill()` reads finished agentsync claims off a **coordination board**. That
+board is a shared, long-lived team artifact — not a property of whichever
+project this session happens to be in — so cambium resolves its address
+independently of the session, using **exactly the order agentsync itself uses**:
+
+1. **`AGENTSYNC_BOARD_REPO`** — the explicit board address (env, or the same key
+   in `~/.cambium/config.json`). One setting configures both servers.
+2. **`AGENTSYNC_REPO`** — agentsync's legacy explicit pin.
+3. **`CAMBIUM_REPO`** — but *only if that repo actually holds the coordination
+   branch* (real ref lookup: local head → remote-tracking ref → `ls-remote`).
+4. Otherwise: **no board**, reported loudly (next section) — never silently.
+
+**Why.** Before this, cambium looked for the coordination branch in
+`CAMBIUM_REPO` while agentsync (unpinned) followed
+`~/.xylem/active_project.json`. The two could point at different repos, and
+whenever the current project had never been provisioned neither found anything.
+`distill()` reported that as the bland string `"no coordination branch found"`,
+callers treated it as normal, and the result was that distill imported **zero**
+agentsync claims across its entire lifetime — a three-legged design silently
+running on two legs.
+
+### A skipped source does not look like a completed one
+
+`distill()`'s return now makes a miss impossible to read as a success:
+
+- top-level `status` becomes `"distilled_with_warnings"` (not `"distilled"`);
+- top-level `warnings` carries a plain-language line per skipped substrate;
+- `sources.agentsync` is an object — `{status, board_repo, board_source, branch,
+  claims_seen, done_claims, imported, reason, fix}` — so "there is no board",
+  "the board is here and nobody has finished anything", and "imported 3" are
+  three visibly different results rather than one empty number.
+
+`status()` reports the same under `substrates.agentsync_board`.
 
 **Org setup**: create one (private) repo, e.g. `github.com/you/knowledge`, with
 an empty `{"items": []}` in `knowledge.json`; everyone who should read org
@@ -378,13 +415,14 @@ seam), and a **real MCP stdio transport test**. CI runs it on every push.
   2026-07-10; the second needed manual conflict resolution against
   `knowledge.json`.) Open a PR, merge it, *then* promote the next — serializing
   avoids the conflict entirely.
-- **Distill's agentsync substrate is the project repo's own `agentsync`
-  branch**, not remote or cross-repo boards. `distill()` `git fetch`es
-  `claims.json` from `<CAMBIUM_REMOTE>/<CAMBIUM_AGENTSYNC_BRANCH>` of the single
-  configured `CAMBIUM_REPO` — it reads *that* repo's coordination branch through
-  git. Work coordinated on a different repo's board, or through the
+- **Distill reads exactly ONE board per run.** `distill()` `git fetch`es
+  `claims.json` from `<CAMBIUM_REMOTE>/<CAMBIUM_AGENTSYNC_BRANCH>` of the repo
+  resolved by [board addressing](#where-the-agentsync-board-lives-board-addressing)
+  — `AGENTSYNC_BOARD_REPO` if set, else `CAMBIUM_REPO` when it genuinely holds
+  the branch. It is no longer pinned to the project repo, but it still does not
+  merge several boards: work coordinated on a *different* board, or through the
   agentsync-remote transport against a different backing store, is invisible to
-  it; point cambium at each repo whose coordination you want distilled.
+  that run. Distill once per board.
 - **Distill captures at the moments it runs, not exhaustively.** By default it
   imports agentsync's *currently* done claims; a claim released or re-claimed
   before any distill catches it live is lost. `CAMBIUM_RELEASE_CAPTURE=1` closes

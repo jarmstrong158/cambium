@@ -293,7 +293,9 @@ def test_distill_from_agentsync_done_claim():
         seed_agentsync_branch(clones["stobie"], {"stobie": DONE_CLAIM})
         be(clones, "jonny")
         r = json.loads(M.distill())
-        assert r["sources"]["agentsync"] == "read", r
+        assert r["sources"]["agentsync"]["status"] == "read", r
+        assert r["sources"]["agentsync"]["done_claims"] == 1, r
+        assert r["sources"]["agentsync"]["imported"] == 1, r
         outcomes = [i for i in r["items"] if i["kind"] == "outcome"]
         assert len(outcomes) == 1, r
         assert "argon2id" in outcomes[0]["content"], r
@@ -308,7 +310,7 @@ def test_distill_from_context_keeper():
         seed_context_keeper(clones["jonny"])
         be(clones, "jonny")
         r = json.loads(M.distill())
-        assert r["sources"]["context_keeper"] == "read", r
+        assert r["sources"]["context_keeper"]["status"] == "read", r
         kinds = sorted(i["kind"] for i in r["items"])
         assert kinds == ["constraint", "decision"], r  # deprecated dec-002 skipped
         rec = json.loads(M.recall("password hashing choice"))
@@ -412,12 +414,111 @@ def test_distill_is_idempotent():
 
 
 def test_distill_reports_missing_substrates():
+    """A SKIPPED SOURCE MUST NOT LOOK LIKE A COMPLETED ONE. The old return said
+    "agentsync": "no coordination branch found" and callers read it as normal —
+    which is why distill imported zero agentsync claims for its entire lifetime
+    and nobody noticed."""
     with lab() as (root, origin, clones):
         be(clones, "jonny")
         r = json.loads(M.distill())
         assert r["new_items"] == 0, r
-        assert "no coordination branch" in r["sources"]["agentsync"], r
-        assert "no .context" in r["sources"]["context_keeper"], r
+        # the top-level status itself changes, so a caller that reads nothing
+        # else still sees that this run was not clean
+        assert r["status"] == "distilled_with_warnings", r
+        assert len(r["warnings"]) == 2, r
+        assert any("agentsync source SKIPPED" in w for w in r["warnings"]), r
+        assert any("context-keeper source SKIPPED" in w for w in r["warnings"]), r
+
+        a = r["sources"]["agentsync"]
+        assert a["status"] == "skipped", a
+        assert a["imported"] == 0, a
+        assert "AGENTSYNC_BOARD_REPO" in a["reason"], a
+        assert "AGENTSYNC_BOARD_REPO" in a["fix"], a
+        assert r["sources"]["context_keeper"]["status"] == "skipped", r
+
+
+def test_distill_reads_the_board_addressed_by_agentsync_board_repo():
+    """THE HEADLINE BUG. The board lives in a DIFFERENT repo from the project
+    cambium is capturing for. Resolving it from the session's project meant the
+    board was never found and distill reported that as normal, forever."""
+    with lab() as (root, origin, clones):
+        # A SEPARATE project entirely — its own origin — holds the board. This
+        # is the real topology: one provisioned coordination repo, many
+        # unrelated projects being captured for.
+        board_root = os.path.join(root, "board-project")
+        os.makedirs(board_root)
+        _board_origin, board_clones = setup_lab(board_root, ("boardkeeper",))
+        seed_agentsync_branch(board_clones["boardkeeper"], {"stobie": DONE_CLAIM})
+
+        be(clones, "jonny")
+        # jonny's project has no board anywhere in reach -> loud skip
+        r = json.loads(M.distill())
+        assert r["sources"]["agentsync"]["status"] == "skipped", r
+        assert r["sources"]["agentsync"]["imported"] == 0, r
+
+        # point at the real board; nothing else changes
+        os.environ["AGENTSYNC_BOARD_REPO"] = board_clones["boardkeeper"]
+        try:
+            r = json.loads(M.distill())
+            a = r["sources"]["agentsync"]
+            assert a["status"] == "read", r
+            assert a["board_source"] == "AGENTSYNC_BOARD_REPO", a
+            assert a["board_repo"] == os.path.abspath(
+                board_clones["boardkeeper"]), a
+            assert a["done_claims"] == 1 and a["imported"] == 1, a
+            assert not any("agentsync source SKIPPED" in w
+                           for w in r["warnings"]), r
+            assert any("argon2id" in i["content"] for i in r["items"]), r
+        finally:
+            os.environ.pop("AGENTSYNC_BOARD_REPO", None)
+
+
+def test_board_repo_pointing_somewhere_boardless_is_reported_not_silent():
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        os.environ["AGENTSYNC_BOARD_REPO"] = clones["stobie"]  # no board there
+        try:
+            r = json.loads(M.distill())
+            a = r["sources"]["agentsync"]
+            assert a["status"] == "skipped", a
+            assert a["board_source"] == "AGENTSYNC_BOARD_REPO", a
+            assert "is not a board" in a["reason"], a
+        finally:
+            os.environ.pop("AGENTSYNC_BOARD_REPO", None)
+
+
+def test_live_board_with_no_done_claims_is_distinguished_from_no_board():
+    """'Read the board, nobody has finished anything' and 'there is no board'
+    are very different facts and must not share a representation."""
+    with lab() as (root, origin, clones):
+        wip = dict(DONE_CLAIM, status="in-progress")
+        seed_agentsync_branch(clones["jonny"], {"stobie": wip})
+        be(clones, "jonny")
+        r = json.loads(M.distill())
+        a = r["sources"]["agentsync"]
+        assert a["status"] == "read", a
+        assert a["claims_seen"] == 1 and a["done_claims"] == 0, a
+        assert any("none are done" in w for w in r["warnings"]), r
+
+
+def test_distill_captures_a_non_canonical_done_status():
+    """claims.json is a foreign substrate cambium does not own. A claim whose
+    status reads "DONE - shipped as 56052d8" (a real shape on the live board)
+    was skipped by an exact == "done" test, which is indistinguishable from
+    'nothing has finished'."""
+    with lab() as (root, origin, clones):
+        shipped = dict(DONE_CLAIM,
+                       status="DONE - shipped to origin/main as 56052d8")
+        seed_agentsync_branch(clones["jonny"], {"stobie": shipped})
+        be(clones, "jonny")
+        r = json.loads(M.distill())
+        assert r["sources"]["agentsync"]["done_claims"] == 1, r
+        assert r["sources"]["agentsync"]["imported"] == 1, r
+        assert any(i["kind"] == "outcome" for i in r["items"]), r
+        # ...but a claim that merely mentions the word is not "done"
+        assert M._claim_is_done({"status": "not done yet"}) is False
+        assert M._claim_is_done({"status": "in-progress"}) is False
+        assert M._claim_is_done({"status": "done"}) is True
 
 
 def test_distill_normalizes_cp1252_mojibake_on_write():
@@ -1901,6 +2002,10 @@ TESTS = [
     test_distill_from_context_keeper,
     test_distill_is_idempotent,
     test_distill_reports_missing_substrates,
+    test_distill_reads_the_board_addressed_by_agentsync_board_repo,
+    test_board_repo_pointing_somewhere_boardless_is_reported_not_silent,
+    test_live_board_with_no_done_claims_is_distinguished_from_no_board,
+    test_distill_captures_a_non_canonical_done_status,
     test_distill_normalizes_cp1252_mojibake_on_write,
     test_distill_reads_legacy_rationale_field,
     test_distill_keeps_the_decision_problem_in_why,

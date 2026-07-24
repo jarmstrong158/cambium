@@ -9,6 +9,9 @@
         "CAMBIUM_REPO": "/abs/path/to/your/project-clone",
         "CAMBIUM_AGENT_ID": "jonny",
 
+        "_board": "Which repo holds the agentsync coordination board distill reads. Set this explicitly and use the SAME value in the agentsync server's config -- the board is a shared team artifact, so its address must not follow the session's project. Omit it only when CAMBIUM_REPO itself holds the agentsync branch.",
+        "AGENTSYNC_BOARD_REPO": "/abs/path/to/the/clone-holding-the-board",
+
         "_optional": "defaults shown below; omit unless you need to change them",
         "CAMBIUM_REMOTE": "origin",
         "CAMBIUM_TEAM_BRANCH": "cambium",
