@@ -1536,6 +1536,71 @@ def test_team_cas_survives_concurrent_push():
         assert "k-peer" in ids and item_id in ids, ids  # both survived
 
 
+def test_promote_does_not_report_success_on_a_push_that_never_landed():
+    """THE clark-mcp DATA-LOSS BUG, reproduced.
+
+    _team_mutate committed, pushed with check=False, and on failure ran
+    `reset --hard <remote>/<branch>` — which itself fails when the remote branch
+    doesn't exist yet, leaving the commit local. The retry then saw a CLEAN
+    `git status --porcelain` and returned True, so promote() reported success
+    and DELETED the local copies. The only surviving copy was an unpushed branch
+    inside .git.
+
+    Here the remote is unreachable and the team branch has never been published,
+    so every push must fail. promote() must report failure and keep the local
+    items."""
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        repo = clones["jonny"]
+        item_id = json.loads(M.capture("dashboards live in ops/, not app/",
+                                       tags="ops"))["item"]["id"]
+        M.endorse(item_id)                      # makes it promotion-eligible
+        cfg = M._cfg()
+
+        # Reproduce the exact broken state: the team branch and its worktree
+        # exist locally, nothing was ever published, and pushes cannot succeed.
+        git(["worktree", "add", "-q", "-b", "cambium", cfg["worktree"],
+             "origin/main"], repo)
+        with open(os.path.join(cfg["worktree"], "knowledge.json"), "w") as f:
+            json.dump({"items": []}, f, indent=2)
+        git(["add", "knowledge.json"], cfg["worktree"])
+        git(["commit", "-qm", "cambium: initialize team knowledge"],
+            cfg["worktree"])
+        git(["remote", "set-url", "origin",
+             os.path.join(root, "nowhere-at-all.git")], repo)
+
+        r = json.loads(M.promote())
+        assert r["status"] == "retry_exhausted", r
+        assert r["promoted"] == 0, r
+        assert "not be published" in r["warning"], r
+
+        # The one thing that must be true: the local copy still exists.
+        local = M._read_local(cfg)["items"]
+        assert [i for i in local if i["id"] == item_id], \
+            "promote() deleted the only copy of an item it failed to publish"
+        assert json.loads(M.recall("where do dashboards live"))["results"], \
+            "the item is no longer recallable"
+
+
+def test_push_landed_is_false_for_an_unpublished_branch():
+    """The verification primitive itself: a commit that exists only locally is
+    never 'landed', no matter how clean the working tree is."""
+    with lab() as (root, origin, clones):
+        be(clones, "jonny")
+        repo, cfg = clones["jonny"], M._cfg()
+        git(["worktree", "add", "-q", "-b", "cambium", cfg["worktree"],
+             "origin/main"], repo)
+        with open(os.path.join(cfg["worktree"], "knowledge.json"), "w") as f:
+            json.dump({"items": []}, f)
+        git(["add", "knowledge.json"], cfg["worktree"])
+        git(["commit", "-qm", "local only"], cfg["worktree"])
+        assert git(["status", "--porcelain"], cfg["worktree"]).stdout == "", \
+            "precondition: a clean tree is what made the old code lie"
+        assert M._push_landed(cfg["worktree"], "origin", "cambium") is False
+        git(["push", "-q", "origin", "cambium"], cfg["worktree"])
+        assert M._push_landed(cfg["worktree"], "origin", "cambium") is True
+
+
 def test_status_overview():
     with lab() as (root, origin, clones):
         seed_context_keeper(clones["jonny"])
@@ -1891,6 +1956,8 @@ TESTS = [
     test_export_markdown_local_and_team_render_without_publishing,
     test_full_compound_growth_loop,
     test_team_cas_survives_concurrent_push,
+    test_promote_does_not_report_success_on_a_push_that_never_landed,
+    test_push_landed_is_false_for_an_unpublished_branch,
     test_status_overview,
     test_status_reports_gaps_when_unconfigured,
     test_every_tool_fails_helpful_when_unconfigured,

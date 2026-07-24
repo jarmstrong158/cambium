@@ -87,6 +87,23 @@ def _noninteractive_env():
     return env
 
 
+def _log(msg):
+    """Append a timestamped line to <repo>/.git/cambium.log. Best-effort: a
+    logging failure must never break a tool call. This is the breadcrumb that
+    turns 'the promotion vanished' into 'the push to the team branch failed at
+    this timestamp with this stderr'."""
+    try:
+        repo = os.environ.get("CAMBIUM_REPO") or _git_root()
+        if not repo or not os.path.isdir(os.path.join(repo, ".git")):
+            return
+        line = f"{datetime.now(timezone.utc).isoformat()} {msg}\n"
+        with open(os.path.join(repo, ".git", "cambium.log"), "a",
+                  encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
+
+
 # --------------------------------------------------------------------------- #
 # config
 #
@@ -477,11 +494,43 @@ def _read_team_wt(cfg):
     return data
 
 
+def _push_landed(wt, remote, branch):
+    """True only if the REMOTE branch actually contains this worktree's HEAD.
+
+    A zero exit from `git push` is not proof on its own once retries are in
+    play, and — more importantly — a clean working tree is not proof at all: a
+    commit that failed to push leaves the tree clean and the work local. This
+    asks the remote directly (ls-remote, no cached ref), then falls back to an
+    ancestry test so a peer pushing on top of us still counts as landed."""
+    head = _git(["rev-parse", "HEAD"], wt, check=False)
+    if head.returncode != 0 or not head.stdout.strip():
+        return False
+    local = head.stdout.strip()
+    ls = _git(["ls-remote", "--heads", remote, branch], wt, check=False)
+    if ls.returncode != 0 or not ls.stdout.strip():
+        return False                      # remote branch does not exist at all
+    if ls.stdout.split()[0] == local:
+        return True
+    _git(["fetch", remote, branch], wt, check=False)
+    return _git(["merge-base", "--is-ancestor", local, f"{remote}/{branch}"],
+                wt, check=False).returncode == 0
+
+
 def _team_mutate(cfg, fn, message):
     """CAS write to the team store: fetch+reset, apply fn(data) (return False
     to abort as a no-op), commit, push; on rejected push resync and retry so a
-    peer's concurrent write is observed, never clobbered."""
+    peer's concurrent write is observed, never clobbered.
+
+    Returns True ONLY when the change is verified present on the remote. It used
+    to report success from a clean working tree alone: a failed push left the
+    commit local, the `reset --hard <remote>/<branch>` meant to undo it ALSO
+    failed whenever the remote branch didn't exist yet, and the next attempt
+    then saw an empty `git status --porcelain` and returned True. promote()
+    trusts that True and deletes the local copies — which is exactly how
+    clark-mcp ended up with nine knowledge items reachable only from an
+    unpushed branch inside .git."""
     wt, remote, branch = cfg["worktree"], cfg["remote"], cfg["team_branch"]
+    last_err = ""
     for attempt in range(PUSH_RETRIES):
         _ensure_team_worktree(cfg)
         data = _read_team_wt(cfg)
@@ -491,14 +540,25 @@ def _team_mutate(cfg, fn, message):
             json.dump(data, f, indent=2)
         _git(["add", KNOWLEDGE_FILE], wt)
         st = _git(["status", "--porcelain"], wt)
-        if not st.stdout.strip():
-            return True
-        _git(["commit", "-m", message], wt)
+        if st.stdout.strip():
+            _git(["commit", "-m", message], wt)
+        elif _push_landed(wt, remote, branch):
+            return True      # genuinely nothing to do; the state is on the remote
+        # else: tree is clean but HEAD is not on the remote — an earlier attempt
+        # committed and failed to push. Do NOT mistake that for success; push it.
         push = _git(["push", remote, branch], wt, check=False)
-        if push.returncode == 0:
+        if push.returncode == 0 and _push_landed(wt, remote, branch):
             return True
-        _git(["reset", "--hard", f"{remote}/{branch}"], wt, check=False)
+        last_err = (push.stderr or push.stdout or "").strip()[:300]
+        _log(f"team push did not land (attempt {attempt + 1}): {last_err}")
+        # Resync only when there is something to resync TO. Resetting to a
+        # nonexistent remote branch is itself an error, and doing it blindly is
+        # what silently discarded the retry's starting point.
+        if _remote_has_branch(cfg["repo"], remote, branch):
+            _git(["reset", "--hard", f"{remote}/{branch}"], wt, check=False)
         time.sleep(0.4 * (attempt + 1))
+    _log(f"team push FAILED after {PUSH_RETRIES} attempts: {last_err} — the "
+         f"commit is local-only on '{branch}' in {cfg['repo']}")
     return False
 
 
@@ -2047,7 +2107,22 @@ def promote(item_id: str = "", to_scope: str = "", force: bool = False,
     if not _team_mutate(cfg, add,
                         f"cambium: {cfg['agent']} promotes {len(candidates)} "
                         "item(s) to team"):
-        return json.dumps({"status": "retry_exhausted"})
+        # The local copies are deliberately NOT removed here — this is the only
+        # remaining copy until the team branch is verifiably on the remote.
+        return json.dumps({
+            "status": "retry_exhausted",
+            "promoted": 0,
+            "warning": "The team branch could not be published, so nothing was "
+                       "promoted and your local copies were left untouched. A "
+                       "commit may exist locally on "
+                       f"'{cfg['team_branch']}' in {cfg['repo']}; check "
+                       f"`git -C \"{cfg['repo']}\" log {cfg['team_branch']}` and "
+                       f"`git -C \"{cfg['repo']}\" push {cfg['remote']} "
+                       f"{cfg['team_branch']}`. See .git/cambium.log for the "
+                       "push error.",
+            "items": [{"id": c["id"], "content": c["content"]}
+                      for c in candidates],
+        }, indent=2)
     data["items"] = [i for i in data["items"] if i["id"] not in ids]
     _write_local(cfg, data)
     moved = [{"id": c["id"], "content": c["content"]} for c in candidates]
