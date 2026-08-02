@@ -2043,6 +2043,10 @@ TESTS = [
     test_session_primer_surfaces_stale_assumptions,
     test_session_primer_empty_project,
     test_promote_team_to_org_requires_endorsement,
+    # these two were defined but never listed, so the standalone runner silently
+    # skipped them (pytest collected them, `python test_cambium.py` did not)
+    test_solo_fast_lane_local_to_org,
+    test_solo_fast_lane_still_enforces_generalization,
     test_org_promotion_blocks_project_specific_body,
     test_org_promotion_with_org_content_generalizes_and_preserves_example,
     test_org_promotion_force_ships_specific_body,

@@ -1502,10 +1502,36 @@ def capture(content: str, type: str = "memory", kind: str = "note",
 
 @mcp.tool()
 def record_need(content: str, why: str = "", tags: str = "") -> str:
-    """Record a NEED — something missing, wanted, or blocking (a first-class
-    citizen alongside memories: 'we need staging seeds', 'docs for X are
-    missing'). Needs surface in recall like any knowledge and can be promoted
-    so the team/org sees recurring wants."""
+    """Record a NEED — something missing, wanted, or blocking. Needs are
+    first-class alongside memories: "we need staging seeds", "docs for X are
+    missing", "no way to replay a failed job".
+
+    When to use this instead of the alternatives:
+      record_need : a GAP. Something that does not exist yet and should.
+      capture     : a FACT you learned. Use it when the thing is already true.
+      distill     : never called by hand for this — it imports work that
+                    already happened, and cannot invent a need.
+
+    Side effects: appends one item to the LOCAL knowledge store on this machine
+    (personal scope) and writes it to disk immediately. Nothing is shared with
+    the team or org until promote() is called on it, and nothing is sent over
+    the network. Recording the same need twice creates two items — this does
+    not deduplicate, so recall() first if you may already have logged it.
+
+    Parameters:
+      content : the need itself, stated concretely. "docs for the retry policy
+                are missing" beats "docs are bad".
+      why     : optional but strongly worth filling. The rationale — what is
+                blocked, or what it costs to leave unfixed. This is what makes
+                the item useful months later when the urgency is forgotten,
+                and it is indexed for recall alongside the content.
+      tags    : optional comma- or space-separated keywords ("ci, flaky,
+                staging"). They boost recall matching, so a future session
+                searching different words can still find this.
+
+    Returns JSON: {"status": "captured", "item": {...}} where item includes the
+    generated id needed by promote(), endorse() and deprecate(). On failure
+    returns {"error": "..."} — an empty content is refused."""
     return capture(content, type="need", kind="need", why=why, tags=tags)
 
 
@@ -1948,9 +1974,44 @@ def recall(query: str, scope: str = "auto", limit: int = 5) -> str:
 
 @mcp.tool()
 def endorse(item_id: str, note: str = "") -> str:
-    """Vouch for an item — the strong trust signal. One endorsement fast-tracks
-    local->team promotion and is REQUIRED for team->org (usage alone never
-    reaches org; someone has to deliberately say 'this is right')."""
+    """Vouch for an item — the strong trust signal, and a human judgement that
+    nothing else in this server can substitute for.
+
+    Why it matters: one endorsement fast-tracks local->team promotion, and it
+    is REQUIRED for team->org. Recall counts alone never reach org scope, by
+    design — popularity is not correctness, so somebody has to deliberately say
+    "this is right" before knowledge becomes org-wide.
+
+    When to use this instead of the alternatives:
+      endorse       : you have CONFIRMED the item is correct and want it to
+                      carry more weight and become promotable.
+      verify_entry  : you re-checked it and want to refresh its freshness date
+                      without adding a trust signal.
+      promote       : you want to move it up a scope now. Endorse first if it
+                      has not cleared the bar.
+      deprecate     : it turned out to be wrong.
+
+    Side effects: appends an endorsement stamp (your agent id, a timestamp, and
+    your note) to the item's trust record and writes it immediately. Endorsing
+    the same item twice appends a SECOND stamp rather than replacing the first
+    — this is deliberate, since two people vouching is stronger than one, but
+    it does mean re-running this inflates the count. Searches local scope
+    first, then team and org.
+
+    Parameters:
+      item_id : the id of the item to vouch for, as returned by recall(),
+                capture(), record_need() or status(). Not the content text —
+                an id that matches nothing in any scope returns an error rather
+                than creating anything.
+      note    : optional free text recording WHY you are vouching — e.g. "hit
+                this in prod on 2026-07-14, the workaround is exact". Stored on
+                the stamp and shown to whoever reviews the promotion later, so
+                it is the difference between a countable vote and a reviewable
+                one.
+
+    Returns JSON: {"status": "endorsed", "scope": "local"|"team"|"org",
+    "item": {...}} naming the scope the item was found in. On failure returns
+    {"error": "..."}."""
     cfg, err = _require_cfg()
     if err:
         return err
