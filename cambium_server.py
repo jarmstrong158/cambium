@@ -62,9 +62,27 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.caching import CacheHint
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("cambium")
+try:
+    from importlib.metadata import version as _pkg_version
+    __version__ = _pkg_version("cambium")
+except Exception:
+    __version__ = "0.0.0+local"
+
+# The tool list is static code, identical for every caller with no auth-scoped
+# variation, so a shared intermediary may cache it. Tool *results* are
+# caller-specific (recall is scoped to the caller's project and promotion
+# tier), but tools/call is not a cacheable method, so none of that is cached.
+mcp = MCPServer(
+    "cambium",
+    version=__version__,
+    cache_hints={
+        "tools/list": CacheHint(ttl_ms=300_000, scope="public"),
+        "server/discover": CacheHint(ttl_ms=300_000, scope="public"),
+    },
+)
 
 KNOWLEDGE_FILE = "knowledge.json"
 KNOWLEDGE_MD = "KNOWLEDGE.md"   # human-readable render of a knowledge store
