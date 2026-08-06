@@ -43,6 +43,7 @@ import datetime as _dt
 import json
 import os
 import subprocess
+import sys
 import webbrowser
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -53,31 +54,16 @@ CK_FILES = (("decisions", "decisions.json"),
             ("pipelines", "pipelines.json"),
             ("constraints", "constraints.json"))
 
-# Mirrors context-keeper's mojibake.py::_MOJIBAKE_MARKERS. Inlined rather than
-# imported so this tool has no cross-repo dependency -- it must run even when
-# the sibling checkout is absent or mid-refactor, which is exactly when you
-# want to look at the stores.
-#
-# Duplicating a pattern list is normally how two copies come to disagree, and
-# they did: this list caught a multiplication-sign mis-decode that
-# context-keeper's did not, which is what exposed con-016-16be. The duplication
-# is tolerable HERE only because nothing is gated on it -- this tool reports and
-# never repairs, so drift makes it under-report rather than silently skip a
-# repair. Keep it in step with the source list when that one changes.
-_MOJI = (
-    "\u00e2\u20ac", "\u00c3\u00a9", "\u00c3\u00a8", "\u00c3\u00bc",
-    "\u00c3\u00b1", "\u00c3\u00a0", "\u00c3\u00b4", "\u00c3\u00b6",
-    "\u00c3\u00a4", "\u00c3\u2014", "\u00c3\u00b7", "\u00e2\u201e",
-    "\u00e2\u02c6", "\u00c2\u00a0", "\u00c2\u00b7", "\u00c2\u00ab",
-    "\u00c2\u00bb", "\u00c2\u00b0", "\u00c2\u00b1",
-)
+# Detection lives in tools/_mojibake.py, shared with repair_mojibake.py.
+# Two tools with two copies of one marker list is how they came to disagree
+# (see that module's docstring).
+sys.path.insert(0, HERE)
+from _mojibake import looks_like_mojibake as looks_garbled  # noqa: E402
+
 
 STALE_DAYS = 30
 THIN_CHARS = 80
 
-
-def looks_garbled(text):
-    return isinstance(text, str) and any(m in text for m in _MOJI)
 
 
 def _read(path):
@@ -127,7 +113,11 @@ def _read_team(project_dir):
     offline against whatever the last fetch brought down. Never fetches: a
     dashboard must not block on the network.
     """
-    for ref in ("cambium", "origin/cambium"):
+    # origin FIRST: the local branch can lag behind what a peer (or a
+    # worktree push from this machine) put on the shared ref, and reporting
+    # stale team knowledge as current is the failure this view exists to
+    # prevent. Observed: local said 16 garbled, origin said 1.
+    for ref in ("origin/cambium", "cambium"):
         try:
             out = subprocess.run(
                 ["git", "show", "%s:%s" % (ref, "knowledge.json")],

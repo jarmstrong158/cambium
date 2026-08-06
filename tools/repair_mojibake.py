@@ -34,16 +34,27 @@ twice, two different ways, is how the two copies come to disagree.
 
 SCOPE
 
-Local stores only (`.cambium/knowledge.json` per project). Team and org scopes
-live on shared git branches; this reports what it can see there and refuses to
-rewrite shared history from a maintenance script.
+Local stores (`.cambium/knowledge.json`) by default. Team scope lives on a
+`cambium` git BRANCH per repo and needs `--team`, because writing it rewrites
+state other machines pull -- a maintenance script should not do that because
+it happened to be run. With `--team --apply` each repair is committed and
+pushed on its own commit, through a throwaway worktree so your checkout is
+never touched.
+
+Team scope is where this matters most: the corruption is concentrated on the
+branches that get recalled, so those items are returned garbled hundreds of
+times while the local copies nobody reads were the clean ones.
 """
 
 import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -54,49 +65,12 @@ DEFAULT_ROOT = os.path.dirname(REPO)
 # break every source ref and promotion pointer aimed at it.
 TEXT_FIELDS = ("content", "why", "example", "deprecated_reason")
 
-# The signatures of UTF-8 read as cp1252. Same list context-keeper uses.
-_MARKERS = (
-    "\u00c3\u00a9", "\u00c3\u00a8", "\u00c3\u00a0", "\u00c3\u00b4",
-    "\u00c3\u00bc", "\u00c3\u00b6", "\u00c3\u00a4", "\u00c3\u00b1",
-    "\u00e2\u20ac\u2122", "\u00e2\u20ac\u201c", "\u00e2\u20ac\u201d",
-    "\u00e2\u20ac\u0153", "\u00e2\u20ac\u009d", "\u00e2\u20ac\u00a6",
-    "\u00e2\u20ac\u02dc", "\u00c3\u2014", "\u00c2\u00a0", "\u00c2\u00b7",
-    "\u00c2\u00ab", "\u00c2\u00bb", "\u00e2\u2020\u2019",
+from _mojibake import (  # noqa: E402
+    MARKERS as _MARKERS,
+    ascii_safe as _ascii,
+    demojibake,
+    looks_like_mojibake,
 )
-
-
-def _ascii(text):
-    """Console-safe. Windows stdout is cp1252, and a SUCCESSFUL repair very
-    often produces exactly the characters cp1252 cannot encode -- an arrow, an
-    em-dash, a curly quote. Printing the fix would then crash on the same
-    encoding boundary the fix exists to heal."""
-    return str(text).encode("ascii", "replace").decode("ascii")
-
-
-def looks_like_mojibake(text):
-    return isinstance(text, str) and any(m in text for m in _MARKERS)
-
-
-def demojibake(text):
-    """Repaired text, or None when this is not recoverable cp1252 damage.
-
-    Verified as an exact inverse: re-applying the corruption to the candidate
-    must reproduce the input byte for byte.
-    """
-    if not looks_like_mojibake(text):
-        return None
-    try:
-        repaired = text.encode("cp1252").decode("utf-8")
-    except (UnicodeEncodeError, UnicodeDecodeError):
-        return None
-    if repaired == text:
-        return None
-    try:
-        if repaired.encode("utf-8").decode("cp1252") != text:
-            return None
-    except (UnicodeEncodeError, UnicodeDecodeError):
-        return None
-    return repaired
 
 
 def scan_item(item):
@@ -150,6 +124,119 @@ def repair_store(path, apply_):
     return len(repairs), fields, unrepairable
 
 
+TEAM_BRANCH = "cambium"
+TEAM_FILE = "knowledge.json"
+
+
+def _git(args, cwd, check=True):
+    r = subprocess.run(["git"] + args, cwd=cwd, capture_output=True, timeout=90)
+    if check and r.returncode != 0:
+        raise RuntimeError("git %s: %s" % (" ".join(args),
+                                           r.stderr.decode("utf-8", "replace")[:300]))
+    return r
+
+
+def find_team_repos(roots):
+    """(name, repo_dir) for every git repo carrying a team knowledge branch."""
+    out = []
+    for root in roots:
+        root = os.path.abspath(root)
+        if not os.path.isdir(root):
+            continue
+        for name in sorted(os.listdir(root)):
+            repo = os.path.join(root, name)
+            if not os.path.isdir(os.path.join(repo, ".git")):
+                continue
+            r = _git(["show", "%s:%s" % (TEAM_BRANCH, TEAM_FILE)], repo, check=False)
+            if r.returncode != 0:
+                r = _git(["show", "origin/%s:%s" % (TEAM_BRANCH, TEAM_FILE)],
+                         repo, check=False)
+            if r.returncode == 0 and r.stdout:
+                out.append((name, repo))
+    return out
+
+
+def scan_team(repo):
+    """(data, repairs, unrepairable) for a repo's team branch, read-only.
+
+    origin FIRST. The local branch can lag behind the shared ref -- including
+    behind a push this very script made on a previous run -- and scanning the
+    stale copy reports work that is already done, or misses work that is not.
+    """
+    for ref in ("origin/" + TEAM_BRANCH, TEAM_BRANCH):
+        r = _git(["show", "%s:%s" % (ref, TEAM_FILE)], repo, check=False)
+        if r.returncode == 0 and r.stdout:
+            try:
+                data = json.loads(r.stdout.decode("utf-8"))
+            except Exception as e:
+                return None, [], [("<branch>", str(e))]
+            repairs = []
+            for item in data.get("items", []):
+                fixes = scan_item(item)
+                if fixes:
+                    repairs.append((item, fixes))
+            return data, repairs, []
+    return None, [], []
+
+
+def repair_team(name, repo, apply_):
+    """Repair the team branch through a throwaway worktree.
+
+    A worktree, not a checkout: your working tree is never touched, so this
+    cannot disturb whatever you had open. Fetches first and branches from the
+    REMOTE tip so a stale local ref cannot silently revert a peer's push.
+    """
+    data, repairs, bad = scan_team(repo)
+    if data is None:
+        return 0, 0, bad
+    fields = sum(len(f) for _i, f in repairs)
+    if not apply_ or not repairs:
+        return len(repairs), fields, bad
+
+    wt = tempfile.mkdtemp(prefix="cambium-repair-")
+    try:
+        _git(["fetch", "origin", TEAM_BRANCH], repo, check=False)
+        base = ("origin/" + TEAM_BRANCH
+                if _git(["rev-parse", "--verify", "origin/" + TEAM_BRANCH],
+                        repo, check=False).returncode == 0 else TEAM_BRANCH)
+        _git(["worktree", "add", "--detach", wt, base], repo)
+        path = os.path.join(wt, TEAM_FILE)
+        with open(path, "r", encoding="utf-8") as f:
+            fresh = json.load(f)
+        n = 0
+        for item in fresh.get("items", []):
+            for field, _before, after in scan_item(item):
+                item[field] = after
+                n += 1
+        if not n:
+            return 0, 0, bad          # someone repaired it between scan and write
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(fresh, f, ensure_ascii=False, indent=2)
+        _git(["add", TEAM_FILE], wt)
+        message = "\n".join([
+            "cambium: repair cp1252 mojibake in %d field(s)" % n,
+            "",
+            "Exact-inverse repair (encode cp1252, decode utf-8), verified per",
+            "field by re-applying the corruption. Fields that did not",
+            "round-trip were left untouched.",
+        ])
+        _git(["commit", "-m", message], wt)
+        push = _git(["push", "origin", "HEAD:%s" % TEAM_BRANCH], wt, check=False)
+        if push.returncode != 0:
+            # An archived repo, a protected branch, a peer who pushed first --
+            # all real and none of them a reason to abandon the other repos.
+            # Report it and move on; the commit dies with the worktree, so a
+            # failed push leaves the branch exactly as it was.
+            why = push.stderr.decode("utf-8", "replace").strip().splitlines()
+            detail = next((l for l in why if "remote:" in l or "fatal:" in l),
+                          why[-1] if why else "push failed")
+            return 0, 0, bad + [("<push>", detail.replace("remote:", "").strip())]
+        return len(repairs), n, bad
+    finally:
+        _git(["worktree", "remove", "--force", wt], repo, check=False)
+        shutil.rmtree(wt, ignore_errors=True)
+
+
 def find_stores(roots):
     out = []
     for root in roots:
@@ -170,6 +257,10 @@ def main(argv=None):
                     help="Write the repairs. Without this, reports only.")
     ap.add_argument("--show", type=int, default=3,
                     help="Sample repairs to print per project (default 3).")
+    ap.add_argument("--team", action="store_true",
+                    help="Also repair team-scope knowledge on each repo's "
+                         "`cambium` branch. With --apply this COMMITS AND "
+                         "PUSHES to a shared branch.")
     args = ap.parse_args(argv)
     roots = args.root or [DEFAULT_ROOT]
 
@@ -206,6 +297,26 @@ def main(argv=None):
 
     print("-" * 42)
     print("%-24s %8d %8d" % ("TOTAL", tot_items, tot_fields))
+
+    if args.team:
+        print()
+        print("%-24s %8s %8s   (team branch)" % ("project", "items", "fields"))
+        print("-" * 56)
+        t_i = t_f = 0
+        for name, repo in find_team_repos(roots):
+            n_i, n_f, bad = repair_team(name, repo, args.apply)
+            all_unrepairable += [(name,) + b for b in bad]
+            if n_i:
+                print("%-24s %8d %8d" % (name, n_i, n_f))
+                t_i += n_i
+                t_f += n_f
+        print("-" * 56)
+        print("%-24s %8d %8d" % ("TEAM TOTAL", t_i, t_f))
+        if t_f and args.apply:
+            print("Committed and pushed to the `cambium` branch of each repo above.")
+        tot_items += t_i
+        tot_fields += t_f
+
     if all_unrepairable:
         print("\nNOT repairable (left untouched -- an approximate fix is worse "
               "than legible damage):")
