@@ -353,10 +353,55 @@ oldest-verified relevant entries right when work completes — so re-checking ri
 an existing workflow beat. Absent or old `last_verified` is a *signal to a human*,
 never an automatic downgrade. cambium reports the smell; a person decides.
 
+## Seeing it: `tools/dashboard.py`
+
+```bash
+python tools/dashboard.py --open
+```
+
+Builds a single self-contained HTML view of the whole mesh — every project's
+context-keeper log **and** the cambium layer distilled from them. Four views:
+
+- **Overview** — the distillation funnel: recorded → active → distilled →
+  *recalled* → promoted. Each stage a subset of the one above.
+- **Projects** — sortable table of every store; click through to one project's
+  full log, its supersession chains, its constraint scopes and its health flags.
+- **Knowledge** — what distillation produced, what actually gets recalled, and
+  where things sit on the local → team → org ladder.
+- **Health** — mojibake, thin rationale, untagged, stale and never-recalled,
+  each as a share of the population it is drawn from so a big store does not
+  look unhealthy merely for being big.
+
+It exists because counting was already possible and *understanding* was not.
+The first run answered a question no single tool could:
+
+| scope | items | recalled | recalls |
+|---|---|---|---|
+| local | 229 | 15 (7%) | 117 |
+| team | 136 | **134 (99%)** | **774** |
+
+**Promotion is what makes knowledge get read.** Local is a staging area and its
+low recall rate is the system working, not failing — a conclusion only visible
+with both scopes in one view. The first version of this tool read
+`.cambium/knowledge.json` alone (local scope only) and reported *"nothing has
+left local"*; team knowledge lives on a git branch, and 136 promoted items were
+being recalled 774 times.
+
+It also surfaced 84 items carrying cp1252 mojibake distilled before
+context-keeper fixed the transport — concentrated on the team branches that are
+recalled most. `tools/repair_mojibake.py` fixes the local stores; the team
+branches are shared git state and are left to a deliberate push.
+
+**Local by design.** The output is gitignored. The mesh spans private repos and
+ones with no remote at all, so a published version could honestly show
+aggregates and nothing more; this one shows everything, because it is yours.
+Read-only, and `test_dashboard.py` asserts that byte-for-byte.
+
 ## Test
 
 ```bash
-python3 test_cambium.py
+python3 test_cambium.py      # server integration suite
+python3 test_dashboard.py    # the mesh dashboard
 ```
 
 62 cases against real git repos: **markdown export** (`KNOWLEDGE.md` grouped by

@@ -8,3 +8,16 @@ venv/
 dist/
 build/
 *.egg-info/
+
+# tools/dashboard.py output. Local by design: it reads every project's memory,
+# including private repos and ones with no remote, so the rendered file must not
+# travel. Regenerate with `python tools/dashboard.py`.
+dashboard.html
+
+# Mirror byproducts: a retry queue, a conflict log and retrieval telemetry.
+# The store itself (.context/decisions.json, constraints.json) IS tracked; these
+# are per-machine and rewritten constantly.
+.context/usage.json
+.context/mirror.log
+.context/.mirror_conflicts.json
+.context/embeddings.json

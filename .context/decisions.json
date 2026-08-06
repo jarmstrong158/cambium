@@ -334,5 +334,105 @@
     "created_at": "2026-07-21T14:16:18.117824+00:00",
     "updated_at": "2026-07-21T14:16:18.117824+00:00",
     "verified_at": "2026-07-21T14:16:18.117824+00:00"
+  },
+  {
+    "id": "dec-012-7c40",
+    "summary": "Rewrote the tool descriptions Glama scored lowest (record_need 3.1, endorse 3.4) to address behavioural disclosure, parameter semantics and when-to-use guidance. Accepted a measured +20% tools/list token cost as a deliberate, bounded trade rather than applying the same treatment catalogue-wide.",
+    "problem": "Glama grades an MCP server 70% on Tool Definition Quality and 30% on Server Coherence, scoring every tool 1-5 and computing the server score as 60% mean plus 40% MINIMUM, so a single terse tool drags the whole server down. cambium sat at grade A but only 75%, with record_need at 3.1 and endorse at 3.4 named as the weakest. The reported gaps were specific: undisclosed side effects, unexplained optional parameters, and no guidance distinguishing a tool from its neighbours.",
+    "why_chosen": "The 40% minimum weighting means effort is best spent on the worst tools rather than spread evenly, and Glama names them, so the target list is given rather than guessed. The rewrites deliberately cover the non-obvious behaviours an agent would otherwise get wrong: endorse appends a SECOND stamp rather than replacing the first, record_need does not deduplicate, and nothing leaves the local scope until promote is called. That is the same information that makes the tool safer to use, so the Glama score and real usability point the same way here.",
+    "what_we_tried": "Checked first whether a schema token budget applied. The string 'Keep the schema under 2500 tokens per TestToolSchemaBudget' appears in test_cambium.py but is FIXTURE DATA for a test about the enforced_by field format, not an actual budget test - cambium has no TestToolSchemaBudget. The real ceiling is context-keeper's con-004, which is why context-keeper was left alone. Measured the cost after the rewrite: cambium's tools/list went from ~4505 to ~5403 estimated tokens.",
+    "tradeoffs": "Tool descriptions load into model context at every session start, so this is a permanent per-session token tax on every user, measured at +20% for cambium. Justified for five high-misuse tools; explicitly NOT a licence to enrich every tool, which would roughly double the payload for diminishing score gains.",
+    "alternatives": [
+      {
+        "option": "Enrich every tool description to maximise the mean",
+        "reason_rejected": "The score weights the minimum at 40%, so the worst tools dominate; enriching already-strong tools (several score 4.8-5.0) buys little and doubles the per-session token cost."
+      },
+      {
+        "option": "Apply the same rewrite to context-keeper",
+        "reason_rejected": "It is already grade A and is governed by con-004, a test-enforced ceiling on the tools/list payload with thin headroom."
+      }
+    ],
+    "constraints_created": [
+      "Before enriching an MCP tool description for score reasons, measure the tools/list token delta and justify it per tool. Verbosity is a per-session cost paid by every user, and Glama's scoring weights the minimum tool at 40%, so only the weakest tools are worth the tax."
+    ],
+    "related_to": [],
+    "tags": [
+      "mcp",
+      "glama",
+      "tool-descriptions",
+      "token-budget",
+      "discoverability"
+    ],
+    "retrieval_hints": [
+      "how is the Glama quality grade calculated",
+      "why did cambium tool descriptions get longer",
+      "which tools did Glama score lowest",
+      "is there a schema token budget in cambium"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-08-02T11:24:50.962532+00:00",
+    "updated_at": "2026-08-02T11:24:50.962532+00:00",
+    "verified_at": "2026-08-02T11:24:50.962532+00:00",
+    "verified_sha": "12efd0d949c34a1f309f4f1056b8464352940698"
+  },
+  {
+    "id": "dec-013-220d",
+    "summary": "cambium/tools/dashboard.py renders the whole memory mesh as one self-contained local HTML: every project's context-keeper log plus the cambium layer distilled from them, across four views (distillation funnel, per-project drill-in, knowledge/promotion ladder, health as a share of each population). Local and gitignored by design; read-only, asserted byte-for-byte.",
+    "problem": "Counting entries was already possible -- the Xylem dashboard reports per-store dec/con counts across 34 projects -- but nothing showed what was INSIDE a store or anything at all about cambium's knowledge, which appeared only as a component tile with a number. The first run answered a question no single tool could, and the answer inverted the naive reading: local scope holds 229 items with 15 recalled (7%), while TEAM scope holds 136 items with 134 recalled (99%) and 774 recalls. Promotion is what makes knowledge get read; local is a staging area and its low recall rate is the system working. That conclusion is only visible with both scopes in one view. It also surfaced 84 items carrying cp1252 mojibake distilled out of stores before context-keeper fixed the transport -- concentrated on the team branches that are recalled most.",
+    "why_chosen": "One artifact for two levels, because they are two questions about the same data: per-repo answers 'what did we decide here and is it still true', the overview answers 'is the knowledge layer earning its keep'. Splitting them into separate tools would have duplicated the collection layer and made the funnel -- which only means anything when you can see both ends -- impossible to draw. LOCAL rather than published is the load-bearing choice: the mesh spans private repos and ones with no remote at all, so a published version could honestly show aggregates and nothing else (con-015-12da), whereas a local one shows entry text, scopes and health per project. Health figures are reported as a share of the population they are drawn from rather than as raw counts, so a large store does not read as unhealthy merely for being large. The tool reads .context/ and .cambium/ as plain JSON and imports neither server, so it runs whatever state those are in -- including a half-written file, which is a normal state for a live store and is covered by a test. Stdlib only, matching the rest of the suite.",
+    "what_we_tried": "The first version read .cambium/knowledge.json only and reported '0 promoted, nothing has left local' -- a real reporting bug, because that file holds LOCAL scope and team knowledge lives on a `cambium` git branch. It produced exactly the wrong headline (a 93%-write-only knowledge layer) and I reported it twice before a check of the shared branches contradicted it. _read_team now reads the branch via `git show`, trying the local ref then the fetched remote one, and never fetching -- a dashboard must not block on the network. Earlier, extending the existing Xylem dashboard was considered and rejected: it is regenerated by an automated workflow from the remote Workers, so a panel fed by local files would be overwritten, and it is published, which caps what it could honestly show to aggregates.",
+    "tradeoffs": "Being local means it cannot be linked or shared, and it sees only what this machine has fetched -- team scope is read from whatever the last `git fetch` brought down, so it can lag. The output is a single ~300KB file with all entry text embedded, fine at 400 entries and needing paging well before it became a problem. Entry text is truncated to 240 characters, so the view is for orientation and triage, not for reading a decision's full rationale. And the team-branch mojibake it surfaces cannot be fixed by tools/repair_mojibake.py, which deliberately refuses to rewrite shared git history from a maintenance script.",
+    "alternatives": [
+      {
+        "option": "A panel on the existing Xylem dashboard",
+        "reason_rejected": "It is regenerated by an automated workflow from the remote Workers, so locally-sourced content would be clobbered; and it is published, which caps what it could honestly show to aggregates."
+      },
+      {
+        "option": "Two separate tools, one per level",
+        "reason_rejected": "Duplicates the collection layer, and the distillation funnel only means anything when both ends are visible in one place."
+      },
+      {
+        "option": "Publish it as a GitHub Pages site like context-keeper's project page",
+        "reason_rejected": "The mesh includes private repos and projects with no remote. A public version could show aggregates only, which is precisely the detail that makes it useful."
+      },
+      {
+        "option": "Import context-keeper's mojibake/scope_rules modules rather than inlining the markers",
+        "reason_rejected": "A cross-repo import makes the tool fail when the sibling checkout is absent or mid-refactor -- exactly when you most want to look at the stores."
+      }
+    ],
+    "constraints_created": [
+      "A tool that reads project memory must be provably read-only -- test_dashboard.py compares every store file byte-for-byte before and after a build.",
+      "dashboard.html is generated and gitignored; it must never be committed, because it embeds entry text from private projects."
+    ],
+    "related_to": [
+      "dec-011-0dc6",
+      "con-001-491f"
+    ],
+    "tags": [
+      "dashboard",
+      "observability",
+      "cambium",
+      "context-keeper",
+      "recall",
+      "tooling"
+    ],
+    "retrieval_hints": [
+      "how do I see all the decision logs",
+      "is anything actually recalling the knowledge",
+      "which projects have mojibake",
+      "visualise the memory mesh",
+      "per-repo decision breakdown"
+    ],
+    "origin": "user",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-08-06T01:57:43.993940+00:00",
+    "updated_at": "2026-08-06T02:21:41.234510+00:00",
+    "verified_at": "2026-08-06T02:21:41.188453+00:00",
+    "verified_sha": "863421be22bcd55d6853e0ef0fac623a2ba2d773"
   }
 ]
