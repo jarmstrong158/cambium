@@ -46,13 +46,24 @@ CK_FILES = (("decisions", "decisions.json"),
             ("pipelines", "pipelines.json"),
             ("constraints", "constraints.json"))
 
-# Same markers context-keeper's mojibake.py uses. Inlined rather than imported
-# so this tool has no cross-repo dependency -- it must run even when the
-# sibling checkout is absent or broken.
-_MOJI = ("\u00c3\u00a9", "\u00c3\u00a8", "\u00c3\u00a0", "\u00c3\u00b4",
-         "\u00e2\u20ac\u2122", "\u00e2\u20ac\u201c", "\u00e2\u20ac\u201d",
-         "\u00e2\u20ac\u0153", "\u00e2\u20ac\u009d", "\u00e2\u20ac\u00a6",
-         "\u00c3\u2014", "\u00c2\u00a0", "\u00c2\u00b7")
+# Mirrors context-keeper's mojibake.py::_MOJIBAKE_MARKERS. Inlined rather than
+# imported so this tool has no cross-repo dependency -- it must run even when
+# the sibling checkout is absent or mid-refactor, which is exactly when you
+# want to look at the stores.
+#
+# Duplicating a pattern list is normally how two copies come to disagree, and
+# they did: this list caught a multiplication-sign mis-decode that
+# context-keeper's did not, which is what exposed con-016-16be. The duplication
+# is tolerable HERE only because nothing is gated on it -- this tool reports and
+# never repairs, so drift makes it under-report rather than silently skip a
+# repair. Keep it in step with the source list when that one changes.
+_MOJI = (
+    "\u00e2\u20ac", "\u00c3\u00a9", "\u00c3\u00a8", "\u00c3\u00bc",
+    "\u00c3\u00b1", "\u00c3\u00a0", "\u00c3\u00b4", "\u00c3\u00b6",
+    "\u00c3\u00a4", "\u00c3\u2014", "\u00c3\u00b7", "\u00e2\u201e",
+    "\u00e2\u02c6", "\u00c2\u00a0", "\u00c2\u00b7", "\u00c2\u00ab",
+    "\u00c2\u00bb", "\u00c2\u00b0", "\u00c2\u00b1",
+)
 
 STALE_DAYS = 30
 THIN_CHARS = 80
