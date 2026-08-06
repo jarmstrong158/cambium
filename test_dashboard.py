@@ -25,7 +25,12 @@ spec.loader.exec_module(dash)
 TESTS = []
 
 
-def test(fn):
+# NOT named `test`: pytest collects any module-level callable whose name starts
+# with "test", so a decorator called test(fn) is collected as a test case and
+# then errors with "fixture 'fn' not found". The suite still passed, so the
+# noise looked cosmetic -- but it is an ERROR line in every run, which is
+# exactly the kind of thing that trains you to ignore red output.
+def case(fn):
     TESTS.append(fn)
     return fn
 
@@ -55,7 +60,7 @@ def _dec(i, **kw):
 
 
 # --------------------------------------------------------------------------- #
-@test
+@case
 def test_reads_both_stores_and_counts_them():
     root = tempfile.mkdtemp(prefix="dash_")
     try:
@@ -80,7 +85,7 @@ def test_reads_both_stores_and_counts_them():
         shutil.rmtree(root, ignore_errors=True)
 
 
-@test
+@case
 def test_never_writes_to_a_store():
     """The one property that matters most: reading your memory cannot change it."""
     root = tempfile.mkdtemp(prefix="dash_")
@@ -105,7 +110,7 @@ def test_never_writes_to_a_store():
         shutil.rmtree(root, ignore_errors=True)
 
 
-@test
+@case
 def test_supersession_links_are_counted():
     root = tempfile.mkdtemp(prefix="dash_")
     try:
@@ -119,7 +124,7 @@ def test_supersession_links_are_counted():
         shutil.rmtree(root, ignore_errors=True)
 
 
-@test
+@case
 def test_flags_thin_untagged_and_garbled():
     root = tempfile.mkdtemp(prefix="dash_")
     try:
@@ -136,7 +141,7 @@ def test_flags_thin_untagged_and_garbled():
         shutil.rmtree(root, ignore_errors=True)
 
 
-@test
+@case
 def test_empty_and_broken_stores_do_not_crash():
     """A half-written JSON file is a normal state for a live store."""
     root = tempfile.mkdtemp(prefix="dash_")
@@ -154,7 +159,7 @@ def test_empty_and_broken_stores_do_not_crash():
         shutil.rmtree(root, ignore_errors=True)
 
 
-@test
+@case
 def test_output_is_one_self_contained_file():
     """No CDN, no sibling assets -- it has to open from a file:// path."""
     root = tempfile.mkdtemp(prefix="dash_")
@@ -175,7 +180,7 @@ def test_output_is_one_self_contained_file():
         shutil.rmtree(root, ignore_errors=True)
 
 
-@test
+@case
 def test_embedded_json_survives_a_closing_script_tag():
     """Entry text is arbitrary prose and can contain </script>."""
     root = tempfile.mkdtemp(prefix="dash_")

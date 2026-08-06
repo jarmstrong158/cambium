@@ -26,7 +26,12 @@ spec.loader.exec_module(rm)
 TESTS = []
 
 
-def test(fn):
+# NOT named `test`: pytest collects any module-level callable whose name starts
+# with "test", so a decorator called test(fn) is collected as a test case and
+# then errors with "fixture 'fn' not found". The suite still passed, so the
+# noise looked cosmetic -- but it is an ERROR line in every run, which is
+# exactly the kind of thing that trains you to ignore red output.
+def case(fn):
     TESTS.append(fn)
     return fn
 
@@ -61,7 +66,7 @@ def _store(root, name, items):
 
 
 # --------------------------------------------------------------------------- #
-@test
+@case
 def test_repair_is_the_exact_inverse_of_the_corruption():
     checked = 0
     for original in ["d_model 256→512", "café naïve",
@@ -77,14 +82,14 @@ def test_repair_is_the_exact_inverse_of_the_corruption():
     assert checked >= 5, f"only {checked} cases were actually exercised"
 
 
-@test
+@case
 def test_clean_text_is_never_touched():
     for clean in ["plain ascii", "already → fixed", "d_model 256->512",
                   "", "numbers 123", "aéb"]:
         assert rm.demojibake(clean) is None, clean
 
 
-@test
+@case
 def test_text_that_does_not_round_trip_is_refused():
     """The guard that matters: a candidate that does not reproduce the input
     when re-corrupted is left alone rather than half-fixed."""
@@ -99,7 +104,7 @@ def test_text_that_does_not_round_trip_is_refused():
             assert corrupt(out) == s, (s, out)
 
 
-@test
+@case
 def test_dry_run_writes_nothing():
     root = tempfile.mkdtemp(prefix="rm_")
     try:
@@ -113,7 +118,7 @@ def test_dry_run_writes_nothing():
         shutil.rmtree(root, ignore_errors=True)
 
 
-@test
+@case
 def test_apply_repairs_and_keeps_a_backup():
     root = tempfile.mkdtemp(prefix="rm_")
     try:
@@ -134,7 +139,7 @@ def test_apply_repairs_and_keeps_a_backup():
         shutil.rmtree(root, ignore_errors=True)
 
 
-@test
+@case
 def test_machine_facing_fields_are_never_rewritten():
     """Rewriting an id would break every source ref and promotion pointer."""
     root = tempfile.mkdtemp(prefix="rm_")
@@ -151,7 +156,7 @@ def test_machine_facing_fields_are_never_rewritten():
         shutil.rmtree(root, ignore_errors=True)
 
 
-@test
+@case
 def test_running_twice_is_a_no_op():
     root = tempfile.mkdtemp(prefix="rm_")
     try:
@@ -164,7 +169,7 @@ def test_running_twice_is_a_no_op():
         shutil.rmtree(root, ignore_errors=True)
 
 
-@test
+@case
 def test_broken_json_is_reported_not_crashed():
     root = tempfile.mkdtemp(prefix="rm_")
     try:
@@ -179,7 +184,7 @@ def test_broken_json_is_reported_not_crashed():
         shutil.rmtree(root, ignore_errors=True)
 
 
-@test
+@case
 def test_console_output_is_ascii_safe():
     """A successful repair often produces exactly the characters Windows
     cp1252 stdout cannot encode. Printing the fix must not crash on the same
