@@ -8,18 +8,24 @@ log, and cambium's knowledge layer sitting on top of them.
 
 WHY THIS EXISTS
 
-Counting entries was already possible; understanding them was not. Two things
-were true across 12 populated stores and nothing surfaced either:
+Counting entries was already possible; understanding them was not. The first
+run answered a question no single tool could, and the answer was the opposite
+of what a naive count suggests:
 
-  * 214 of 229 distilled items had never been recalled -- and 111 of the 117
-    total recalls came from a single project. A knowledge layer that is 93%
-    write-only is either mis-scoped or capturing the wrong things, and you
-    cannot tell which from a count.
-  * 69 of 229 items carried cp1252 mojibake, distilled out of stores before
-    context-keeper fixed the transport. cambium has no repair path, so the
-    corruption simply sits there being recalled.
+    scope     items   recalled   recalls
+    local       229     15 (7%)      117
+    team        136    134 (99%)     774
 
-Both are aggregate properties. Neither is visible in any single tool's output.
+Promotion is what makes knowledge get READ. Local is a staging area, and its
+low recall rate is the system working, not failing -- a conclusion only
+visible once both scopes are in one view. (This tool got that wrong at first:
+it read .cambium/knowledge.json only, which holds local scope, and reported
+"nothing has left local" while 136 promoted items were being recalled 774
+times. See _read_team.)
+
+It also found 84 items carrying cp1252 mojibake distilled out of stores before
+context-keeper fixed the transport -- concentrated, unhelpfully, on the team
+branches that are recalled most.
 
 LOCAL BY DESIGN
 
@@ -36,6 +42,7 @@ import argparse
 import datetime as _dt
 import json
 import os
+import subprocess
 import webbrowser
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -106,11 +113,39 @@ def _reason_len(kind, e):
     return len((e.get("purpose") or "").strip())
 
 
+def _read_team(project_dir):
+    """Team-scope knowledge, which lives on a `cambium` git BRANCH, not on disk.
+
+    Reading only .cambium/knowledge.json was a real reporting bug: that file
+    holds local scope only, so the first version of this dashboard reported
+    "0 promoted, nothing has left local" while 65 items sat at team scope
+    across four repos with 315 recalls between them. It inverted the headline
+    finding -- promoted knowledge is the part that IS being read; local is the
+    staging area that is not.
+
+    Tries the local branch first, then the fetched remote ref, so it works
+    offline against whatever the last fetch brought down. Never fetches: a
+    dashboard must not block on the network.
+    """
+    for ref in ("cambium", "origin/cambium"):
+        try:
+            out = subprocess.run(
+                ["git", "show", "%s:%s" % (ref, "knowledge.json")],
+                cwd=project_dir, capture_output=True, timeout=10)
+            if out.returncode == 0 and out.stdout:
+                data = json.loads(out.stdout.decode("utf-8"))
+                return data.get("items", data if isinstance(data, list) else [])
+        except Exception:
+            continue
+    return []
+
+
 def collect_project(name, project_dir):
-    """Everything one project's two stores can tell us. None if it has neither."""
+    """Everything one project's stores can tell us. None if it has none."""
     ctx = os.path.join(project_dir, ".context")
     cam = os.path.join(project_dir, ".cambium", "knowledge.json")
-    if not os.path.isdir(ctx) and not os.path.exists(cam):
+    has_git = os.path.isdir(os.path.join(project_dir, ".git"))
+    if not os.path.isdir(ctx) and not os.path.exists(cam) and not has_git:
         return None
 
     entries, counts = [], {}
@@ -156,6 +191,7 @@ def collect_project(name, project_dir):
             cam_raw = (json.load(open(cam, encoding="utf-8")) or {}).get("items", [])
         except Exception:
             cam_raw = []
+    cam_raw = list(cam_raw) + _read_team(project_dir)
     for i in cam_raw:
         trust = i.get("trust") or {}
         items.append({

@@ -373,11 +373,24 @@ context-keeper log **and** the cambium layer distilled from them. Four views:
   look unhealthy merely for being big.
 
 It exists because counting was already possible and *understanding* was not.
-The first run across 12 populated stores surfaced two things no single tool
-reports: **214 of 229 distilled items had never been recalled** (and 111 of the
-117 total recalls came from one project), and **69 of 229 carried cp1252
-mojibake** distilled out of stores before context-keeper fixed the transport —
-which cambium has no repair path for.
+The first run answered a question no single tool could:
+
+| scope | items | recalled | recalls |
+|---|---|---|---|
+| local | 229 | 15 (7%) | 117 |
+| team | 136 | **134 (99%)** | **774** |
+
+**Promotion is what makes knowledge get read.** Local is a staging area and its
+low recall rate is the system working, not failing — a conclusion only visible
+with both scopes in one view. The first version of this tool read
+`.cambium/knowledge.json` alone (local scope only) and reported *"nothing has
+left local"*; team knowledge lives on a git branch, and 136 promoted items were
+being recalled 774 times.
+
+It also surfaced 84 items carrying cp1252 mojibake distilled before
+context-keeper fixed the transport — concentrated on the team branches that are
+recalled most. `tools/repair_mojibake.py` fixes the local stores; the team
+branches are shared git state and are left to a deliberate push.
 
 **Local by design.** The output is gitignored. The mesh spans private repos and
 ones with no remote at all, so a published version could honestly show
