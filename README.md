@@ -353,10 +353,42 @@ oldest-verified relevant entries right when work completes — so re-checking ri
 an existing workflow beat. Absent or old `last_verified` is a *signal to a human*,
 never an automatic downgrade. cambium reports the smell; a person decides.
 
+## Seeing it: `tools/dashboard.py`
+
+```bash
+python tools/dashboard.py --open
+```
+
+Builds a single self-contained HTML view of the whole mesh — every project's
+context-keeper log **and** the cambium layer distilled from them. Four views:
+
+- **Overview** — the distillation funnel: recorded → active → distilled →
+  *recalled* → promoted. Each stage a subset of the one above.
+- **Projects** — sortable table of every store; click through to one project's
+  full log, its supersession chains, its constraint scopes and its health flags.
+- **Knowledge** — what distillation produced, what actually gets recalled, and
+  where things sit on the local → team → org ladder.
+- **Health** — mojibake, thin rationale, untagged, stale and never-recalled,
+  each as a share of the population it is drawn from so a big store does not
+  look unhealthy merely for being big.
+
+It exists because counting was already possible and *understanding* was not.
+The first run across 12 populated stores surfaced two things no single tool
+reports: **214 of 229 distilled items had never been recalled** (and 111 of the
+117 total recalls came from one project), and **69 of 229 carried cp1252
+mojibake** distilled out of stores before context-keeper fixed the transport —
+which cambium has no repair path for.
+
+**Local by design.** The output is gitignored. The mesh spans private repos and
+ones with no remote at all, so a published version could honestly show
+aggregates and nothing more; this one shows everything, because it is yours.
+Read-only, and `test_dashboard.py` asserts that byte-for-byte.
+
 ## Test
 
 ```bash
-python3 test_cambium.py
+python3 test_cambium.py      # server integration suite
+python3 test_dashboard.py    # the mesh dashboard
 ```
 
 62 cases against real git repos: **markdown export** (`KNOWLEDGE.md` grouped by

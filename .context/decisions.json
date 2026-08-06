@@ -334,5 +334,48 @@
     "created_at": "2026-07-21T14:16:18.117824+00:00",
     "updated_at": "2026-07-21T14:16:18.117824+00:00",
     "verified_at": "2026-07-21T14:16:18.117824+00:00"
+  },
+  {
+    "id": "dec-012-7c40",
+    "summary": "Rewrote the tool descriptions Glama scored lowest (record_need 3.1, endorse 3.4) to address behavioural disclosure, parameter semantics and when-to-use guidance. Accepted a measured +20% tools/list token cost as a deliberate, bounded trade rather than applying the same treatment catalogue-wide.",
+    "problem": "Glama grades an MCP server 70% on Tool Definition Quality and 30% on Server Coherence, scoring every tool 1-5 and computing the server score as 60% mean plus 40% MINIMUM, so a single terse tool drags the whole server down. cambium sat at grade A but only 75%, with record_need at 3.1 and endorse at 3.4 named as the weakest. The reported gaps were specific: undisclosed side effects, unexplained optional parameters, and no guidance distinguishing a tool from its neighbours.",
+    "why_chosen": "The 40% minimum weighting means effort is best spent on the worst tools rather than spread evenly, and Glama names them, so the target list is given rather than guessed. The rewrites deliberately cover the non-obvious behaviours an agent would otherwise get wrong: endorse appends a SECOND stamp rather than replacing the first, record_need does not deduplicate, and nothing leaves the local scope until promote is called. That is the same information that makes the tool safer to use, so the Glama score and real usability point the same way here.",
+    "what_we_tried": "Checked first whether a schema token budget applied. The string 'Keep the schema under 2500 tokens per TestToolSchemaBudget' appears in test_cambium.py but is FIXTURE DATA for a test about the enforced_by field format, not an actual budget test - cambium has no TestToolSchemaBudget. The real ceiling is context-keeper's con-004, which is why context-keeper was left alone. Measured the cost after the rewrite: cambium's tools/list went from ~4505 to ~5403 estimated tokens.",
+    "tradeoffs": "Tool descriptions load into model context at every session start, so this is a permanent per-session token tax on every user, measured at +20% for cambium. Justified for five high-misuse tools; explicitly NOT a licence to enrich every tool, which would roughly double the payload for diminishing score gains.",
+    "alternatives": [
+      {
+        "option": "Enrich every tool description to maximise the mean",
+        "reason_rejected": "The score weights the minimum at 40%, so the worst tools dominate; enriching already-strong tools (several score 4.8-5.0) buys little and doubles the per-session token cost."
+      },
+      {
+        "option": "Apply the same rewrite to context-keeper",
+        "reason_rejected": "It is already grade A and is governed by con-004, a test-enforced ceiling on the tools/list payload with thin headroom."
+      }
+    ],
+    "constraints_created": [
+      "Before enriching an MCP tool description for score reasons, measure the tools/list token delta and justify it per tool. Verbosity is a per-session cost paid by every user, and Glama's scoring weights the minimum tool at 40%, so only the weakest tools are worth the tax."
+    ],
+    "related_to": [],
+    "tags": [
+      "mcp",
+      "glama",
+      "tool-descriptions",
+      "token-budget",
+      "discoverability"
+    ],
+    "retrieval_hints": [
+      "how is the Glama quality grade calculated",
+      "why did cambium tool descriptions get longer",
+      "which tools did Glama score lowest",
+      "is there a schema token budget in cambium"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-08-02T11:24:50.962532+00:00",
+    "updated_at": "2026-08-02T11:24:50.962532+00:00",
+    "verified_at": "2026-08-02T11:24:50.962532+00:00",
+    "verified_sha": "12efd0d949c34a1f309f4f1056b8464352940698"
   }
 ]
