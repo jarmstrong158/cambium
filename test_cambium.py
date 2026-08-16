@@ -2256,6 +2256,74 @@ def test_compile_project_leaves_no_page_stale_on_arrival():
                    for c in unfiled["stale_causes"]), unfiled
 
 
+def test_tags_that_slugify_alike_get_separate_pages():
+    """`ci/cd` and `ci-cd` slugged identically, so the second cluster silently
+    overwrote the first while compile_project counted both as covered."""
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny")
+        decs = _ctx_load(clones["jonny"], "decisions.json")
+        for i, tag in enumerate(("ci/cd", "ci/cd", "ci-cd", "ci-cd")):
+            d = _extra_decision("dec-1%02d" % i, "entry about %s" % tag, [tag])
+            decs.append(d)
+        _ctx_save(clones["jonny"], "decisions.json", decs)
+        r = json.loads(M.compile_project())
+        ids = [p["id"] for p in M._read_pages(M._cfg())["pages"]]
+        assert len(ids) == len(set(ids)), ids          # no id collisions
+        tagpages = [p for p in M._read_pages(M._cfg())["pages"]
+                    if p["selector"]["kind"] == "tag"]
+        vals = sorted(p["selector"]["value"] for p in tagpages)
+        assert "ci/cd" in vals and "ci-cd" in vals, vals
+        # and every entry really is on a page, not just counted as covered
+        on_pages = {s["entry_id"] for p in tagpages for s in p["sources"]}
+        assert {"dec-100", "dec-101", "dec-102", "dec-103"} <= on_pages, on_pages
+
+
+def test_an_entry_leaving_the_unfiled_set_makes_that_page_stale():
+    """Unfiled membership depends on OTHER entries: a second entry pushing a tag
+    over the cluster floor removes the first from the uncovered set without
+    touching its bytes, so nothing about it alone could signal the change."""
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny")
+        decs = _ctx_load(clones["jonny"], "decisions.json")
+        decs.append(_extra_decision("dec-050", "lonely tag", ["solo"]))
+        _ctx_save(clones["jonny"], "decisions.json", decs)
+        M.compile_project()
+        unfiled = next(p for p in M._read_pages(M._cfg())["pages"]
+                       if p["selector"]["kind"] == "unfiled")
+        assert [s["entry_id"] for s in unfiled["sources"]] == ["dec-050"], unfiled
+        assert json.loads(M.list_pages(stale_only=True))["count"] == 0
+
+        # a second `solo` entry forms a cluster; dec-050 is no longer unfiled
+        decs = _ctx_load(clones["jonny"], "decisions.json")
+        decs.append(_extra_decision("dec-051", "second solo", ["solo"]))
+        _ctx_save(clones["jonny"], "decisions.json", decs)
+        stale = json.loads(M.list_pages(stale_only=True))
+        page = next(p for p in stale["pages"] if p["selector"]["kind"] == "unfiled")
+        assert any(c["entry_id"] == "dec-050" and c["cause"] == "no_longer_matches"
+                   for c in page["stale_causes"]), page
+
+
+def test_export_pages_with_a_project_filter_spares_other_projects():
+    with lab(collaborators=("jonny", "stobie")) as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        seed_context_keeper(clones["stobie"])
+        be(clones, "jonny", CAMBIUM_PROJECTS="peer=%s" % clones["stobie"])
+        M.compile_project()
+        M.compile_project(project="peer")
+        out = os.path.join(root, "vault")
+        M.export_pages(out_dir=out)
+        before = sorted(f for f in os.listdir(out) if f.endswith(".md"))
+        assert any(f.startswith("peer-") for f in before), before
+
+        # re-exporting ONE project must not reap the other's pages
+        r = json.loads(M.export_pages(out_dir=out, project="jonny"))
+        after = sorted(f for f in os.listdir(out) if f.endswith(".md"))
+        assert r["removed_orphans"] == [], r
+        assert after == before, (before, after)
+
+
 def test_unknown_project_is_refused_with_the_names_that_would_work():
     with lab() as (root, origin, clones):
         seed_context_keeper(clones["jonny"])
@@ -2568,6 +2636,9 @@ TESTS = [
     test_compile_project_pages_the_untagged_entries_instead_of_dropping_them,
     test_page_synthesizes_the_graph_rather_than_listing_entries,
     test_compile_project_leaves_no_page_stale_on_arrival,
+    test_tags_that_slugify_alike_get_separate_pages,
+    test_an_entry_leaving_the_unfiled_set_makes_that_page_stale,
+    test_export_pages_with_a_project_filter_spares_other_projects,
     test_unknown_project_is_refused_with_the_names_that_would_work,
     test_capture_and_recall_local,
     test_recall_abstains_on_nonsense,

@@ -2864,6 +2864,30 @@ def _page_slug(text):
     return s or "page"
 
 
+def _page_key(project, selector):
+    """The page's slug, injective over (kind, raw value).
+
+    _page_slug collapses every run of non-alphanumerics to one dash, so `ci/cd`,
+    `ci-cd` and `ci cd` all produced the SAME slug -- and _upsert_page replaces
+    by id, so the second cluster silently overwrote the first while
+    compile_project counted both as covered. A tag named `all` collided with the
+    all-entries page for the same reason.
+
+    The kind is in the key, and a short digest of the raw value is appended
+    whenever slugging was lossy, so two distinct tags can never land on one
+    page. A slug that survives untouched keeps its clean name."""
+    kind = selector.get("kind") or "all"
+    raw = str(selector.get("value") or "")
+    slug = _page_slug(f"{project}-{raw or kind}")
+    lossy = raw and _page_slug(raw) != raw.strip().lower()
+    if kind in ("topic", "index", "unfiled", "all") or lossy:
+        stamp = hashlib.sha1(f"{kind}\x00{raw}".encode("utf-8")).hexdigest()[:6]
+        if kind in ("index", "unfiled", "all") and not lossy:
+            return _page_slug(f"{project}-{kind}")   # stable, no rival possible
+        return f"{slug}-{stamp}"
+    return slug
+
+
 def _related_slugs(own_slug, own_ids, others, index_slug=None, limit=12):
     """Pages genuinely related to this one: they share at least one entry, or an
     entry here names an entry there.
@@ -3312,10 +3336,10 @@ def _build_page(project, title, selector, chosen, candidate_count,
         (body_hash + json.dumps(sources, sort_keys=True)).encode("utf-8")
     ).hexdigest()
     return {
-        "id": "page-" + _page_slug(f"{project}-{selector['value'] or 'all'}"),
+        "id": "page-" + _page_key(project, selector),
         "project": project,
         "title": title,
-        "slug": _page_slug(f"{project}-{selector['value'] or 'all'}"),
+        "slug": _page_key(project, selector),
         "selector": selector,
         "sources": sources,
         "candidate_count": candidate_count,
@@ -3376,6 +3400,17 @@ def _page_staleness(page, entries):
         for eid in sorted(expected - known):
             causes.append({"entry_id": eid, "cause": "new_match",
                            "detail": "entry now matches this page's selector"})
+        # The symmetric case, which nothing was checking. On a tag page a
+        # departing entry is caught incidentally because its own hash moves, but
+        # UNFILED membership is a function of OTHER entries: a second entry
+        # pushing a tag over the cluster floor takes the first one out of the
+        # uncovered set without touching its bytes. The page kept listing it,
+        # reported clean, and the newly-formed cluster had no page at all.
+        for eid in sorted(known - expected):
+            if eid in entries:    # a missing entry is already `orphaned` above
+                causes.append({"entry_id": eid, "cause": "no_longer_matches",
+                               "detail": "entry no longer matches this page's "
+                                         "selector"})
     causes.sort(key=lambda c: (c["entry_id"], c["cause"]))
     return (bool(causes), causes)
 
@@ -3457,7 +3492,7 @@ def compile_page(project: str = "", tag: str = "", topic: str = "",
     # A page never links to itself, so its own slug is excluded BEFORE compiling
     # — the links are part of the body, and a body that linked to itself would
     # differ from the same page compiled fresh.
-    own_slug = _page_slug(f"{project}-{selector['value'] or 'all'}")
+    own_slug = _page_key(project, selector)
     entries_now = _read_entries(context_dir)
     own_ids = set(_select_entries(
         entries_now,
@@ -3466,7 +3501,7 @@ def compile_page(project: str = "", tag: str = "", topic: str = "",
     others = {p["slug"]: {s["entry_id"] for s in p.get("sources", [])}
               for p in data["pages"]
               if p.get("project") == project and p.get("slug")}
-    index_slug = _page_slug(f"{project}-index")
+    index_slug = _page_key(project, {"kind": "index", "value": ""})
     siblings = _related_slugs(own_slug, own_ids, others,
                               index_slug if index_slug in others else None)
     page = _compile_one(cfg, project, context_dir, label, selector, siblings)
@@ -3511,12 +3546,13 @@ def compile_project(project: str = "", min_cluster: int = 0) -> str:
     covered = {eid for ids in tally.values() for eid in ids}
     unfiled = sorted(set(active) - covered)
 
-    index_slug = _page_slug(f"{project}-index")
+    index_slug = _page_key(project, {"kind": "index", "value": ""})
     # Entry set per page, known up front, so cross-links can be computed from
     # actual overlap instead of "everything else in this project".
-    page_ids = {_page_slug(f"{project}-{t}"): set(tally[t]) for t in clusters}
+    page_ids = {_page_key(project, {"kind": "tag", "value": t}): set(tally[t])
+                for t in clusters}
     if unfiled:
-        page_ids[_page_slug(f"{project}-unfiled")] = set(unfiled)
+        page_ids[_page_key(project, {"kind": "unfiled", "value": "unfiled"})] = set(unfiled)
     slugs = sorted(page_ids)
 
     data = _read_pages(cfg)
@@ -3526,7 +3562,7 @@ def compile_project(project: str = "", min_cluster: int = 0) -> str:
 
     built = []
     for t in clusters:
-        own = _page_slug(f"{project}-{t}")
+        own = _page_key(project, {"kind": "tag", "value": t})
         page = _compile_one(cfg, project, context_dir, t,
                             {"kind": "tag", "value": t},
                             _related_slugs(own, page_ids[own], page_ids,
@@ -3535,7 +3571,7 @@ def compile_project(project: str = "", min_cluster: int = 0) -> str:
         built.append(page)
     if unfiled:
         chosen = {eid: active[eid] for eid in unfiled}
-        own = _page_slug(f"{project}-unfiled")
+        own = _page_key(project, {"kind": "unfiled", "value": "unfiled"})
         page = _build_page(project, "unfiled",
                            {"kind": "unfiled", "value": "unfiled", "floor": floor},
                            chosen, len(active),
@@ -3549,11 +3585,11 @@ def compile_project(project: str = "", min_cluster: int = 0) -> str:
                   "*%d active entries across %d cluster pages.*"
                   % (len(active), len(clusters)), ""]
     for t in clusters:
-        index_body.append("- [[%s]] — %d entries" % (_page_slug(f"{project}-{t}"),
+        index_body.append("- [[%s]] — %d entries" % (_page_key(project, {"kind": "tag", "value": t}),
                                                      len(tally[t])))
     if unfiled:
         index_body.append("- [[%s]] — %d entries matching no cluster"
-                          % (_page_slug(f"{project}-unfiled"), len(unfiled)))
+                          % (_page_key(project, {"kind": "unfiled", "value": "unfiled"}), len(unfiled)))
     index = {
         "id": "page-" + index_slug, "project": project,
         "title": f"{project} — index", "slug": index_slug,
@@ -3688,7 +3724,7 @@ def recompile(page_id: str = "", all_stale: bool = False) -> str:
         others = {p["slug"]: {s["entry_id"] for s in p.get("sources", [])}
                   for p in data["pages"]
                   if p.get("project") == proj and p.get("slug")}
-        idx = _page_slug(f"{proj}-index")
+        idx = _page_key(proj, {"kind": "index", "value": ""})
         siblings = _related_slugs(
             page.get("slug"), {s["entry_id"] for s in page.get("sources", [])},
             others, idx if idx in others else None)
@@ -3818,7 +3854,11 @@ def export_pages(out_dir: str = "", project: str = "") -> str:
             f.write("\n".join(out))
         written.append(name)
 
-    # Reap only our own leftovers, identified by the marker in the frontmatter.
+    # Reap only our own leftovers, identified by the marker in the frontmatter —
+    # and, when a project filter is in effect, only that project's files. The
+    # reaper previously deleted every page it had not just written, so exporting
+    # one project into a shared vault removed every OTHER project's pages while
+    # reporting success.
     removed = []
     for existing in sorted(os.listdir(out_dir)):
         if not existing.endswith(".md") or existing in wanted:
@@ -3826,8 +3866,13 @@ def export_pages(out_dir: str = "", project: str = "") -> str:
         path = os.path.join(out_dir, existing)
         try:
             with open(path, encoding="utf-8") as f:
-                if PAGES_MARKER not in f.read(400):
-                    continue          # not ours — leave it alone
+                head = f.read(400)
+            if PAGES_MARKER not in head:
+                continue              # not ours — leave it alone
+            if project:
+                m = re.search(r"^project:\s*(.+)$", head, re.M)
+                if not m or m.group(1).strip() != project:
+                    continue          # another project's page; not this run's business
             os.remove(path)
             removed.append(existing)
         except OSError:
