@@ -3259,12 +3259,21 @@ def _read_pages(cfg):
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        # Unlike knowledge.json there is nothing to quarantine and nothing to
-        # lose: pages are wholly derived, so a corrupt store is repaired by
-        # recompiling. Starting clean IS the recovery.
+    except OSError:
+        return _empty_pages()
+    except json.JSONDecodeError:
+        # QUARANTINE, exactly as _read_local does. The old comment claimed there
+        # was "nothing to lose because pages are wholly derived" -- but a page's
+        # TITLE and a topic selector's query string are typed by a human into
+        # compile_page and exist nowhere in .context/, and the set of projects
+        # that had been compiled is not recoverable either. Worse, returning
+        # empty here meant the next compile wrote that empty store back plus one
+        # page, silently destroying every other compiled page while reporting
+        # success -- the precise failure _read_local was fixed for.
+        _quarantine_corrupt(path)
         return _empty_pages()
     if not isinstance(data, dict):
+        _quarantine_corrupt(path)
         return _empty_pages()
     data.setdefault("pages", [])
     return data
@@ -3895,7 +3904,17 @@ def _quality_gaps(project_dir, include_bodies):
             runner + ["verify_quality", json.dumps({"project_dir": project_dir})],
             capture_output=True, text=True, timeout=GIT_TIMEOUT,
             env=_noninteractive_env())
-        data = json.loads(p.stdout or "{}")
+        # THE EXIT CODE IS THE ANSWER. Without this check a crashed
+        # verify_quality -- an import traceback, an unknown-tool exit 2 from an
+        # older build, a wrong CAMBIUM_CONTEXT_KEEPER target -- writes its error
+        # to stderr, leaves stdout empty, decodes as {} and sails through every
+        # guard below as "checked: true, zero gaps". A scan that never ran would
+        # render as a clean bill of health for every project in the snapshot.
+        if p.returncode != 0 or not (p.stdout or "").strip():
+            reason = (p.stderr or "").strip() or (
+                "verify_quality exited %d with no output" % p.returncode)
+            return {"checked": False, "reason": reason[:300], "gaps": None}
+        data = json.loads(p.stdout)
     except (OSError, ValueError, subprocess.SubprocessError) as e:
         return {"checked": False, "reason": f"verify_quality failed: {e}",
                 "gaps": None}
@@ -4267,7 +4286,7 @@ def _build_snapshot(cfg, include_bodies=False):
 
 
 @mcp.tool()
-def refresh(out: str = "", vault: str = "", include_bodies: bool = True) -> str:
+def refresh(out: str = "", vault: str = "", include_bodies: bool = False) -> str:
     """Bring every derived surface up to date in one call: recompile each named
     project's pages, rewrite the markdown vault, and re-export the snapshot.
 
@@ -4593,14 +4612,31 @@ def _run_cli(argv):
     if name == "export-pages":
         result = export_pages(out_dir=out, project=project)
     elif name == "refresh":
-        result = refresh(out=out, vault=vault)
+        # --bodies was parsed and then thrown away here, so the one path
+        # documented "to be wired to a hook" wrote full entry prose
+        # unconditionally while export-snapshot required the flag. The same CLI
+        # had opposite defaults for the same privacy switch, and the automated
+        # path had the unsafe one.
+        result = refresh(out=out, vault=vault, include_bodies=bodies)
     else:
         result = export_snapshot(out=out, include_bodies=bodies)
     sys.stdout.write(result + "\n")
+    # A hook's ONLY channel is the exit code. Keying it on an "error" key alone
+    # meant an unconfigured machine -- where _require_cfg returns guidance with
+    # configured:false and no "error" key -- ran refresh, did nothing at all,
+    # and exited 0. The hook this command exists for could not tell a full
+    # refresh from a total no-op.
     try:
-        return 1 if json.loads(result).get("error") else 0
+        payload = json.loads(result)
     except (ValueError, AttributeError):
         return 0
+    if not isinstance(payload, dict):
+        return 0
+    if payload.get("error") or payload.get("configured") is False:
+        return 1
+    if payload.get("failed"):
+        return 1
+    return 0
 
 
 def main():

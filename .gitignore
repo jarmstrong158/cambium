@@ -14,26 +14,25 @@ build/
 # travel. Regenerate with `python tools/dashboard.py`.
 dashboard.html
 
-# Compiled pages and the mesh snapshot. Both are BUILD ARTIFACTS derived from
-# .context/ stores — regenerate with compile_project / export-snapshot. They are
-# gitignored for two independent reasons: a snapshot spans every project named
-# in CAMBIUM_PROJECTS, including private repos and ones with no remote (the same
-# rule that keeps dashboard.html local, and con-015-12da in context-keeper), and
-# a page carries a compiled_at that would churn this repo's history on every
-# rebuild while adding nothing the entries do not already say.
-.cambium/pages.json
-.cambium/snapshot.json
-
-# The LOCAL knowledge store. DESIGN calls local scope "yours; not shared" — but
-# local scope lives in the project repo, and THIS project repo is public, so
-# "not shared" and "committed here" are in direct contradiction. It was tracked
-# while it happened to be empty; the moment it held real captures it carried
-# dozens of references to other projects on the machine, including one with no
-# remote at all — precisely what con-015-12da forbids, and that constraint notes
-# the failure cannot be reliably unpublished once pushed.
-# Knowledge that should travel goes to team or org scope, which have their own
-# repos and their own gates. Local stays on the machine.
-.cambium/knowledge.json
+# EVERYTHING cambium writes into this repo. All of it is either a build artifact
+# derived from .context/ stores (pages, snapshot, exported page markdown) or the
+# LOCAL knowledge store — and every one of them spans whatever projects are named
+# in CAMBIUM_PROJECTS, including private repos and ones with no remote. That is
+# what con-015-12da forbids, and it notes the failure cannot be reliably
+# unpublished once pushed.
+#
+# The whole DIRECTORY, deliberately, because this file previously enumerated
+# individual names and had already drifted narrower than the rule it restates:
+# export_pages' default output (.cambium/pages/*.md, full entry prose from every
+# named project) was unignored, and docs/model-written-pages.md names a future
+# .cambium/essays.json that would have been too. `.cambium/` is also exactly what
+# setup()'s _ensure_gitignored writes, so there is now one authority for it.
+#
+# DESIGN calls local scope "yours; not shared" — but local scope lives in the
+# project repo and this repo is public, so those two statements contradict each
+# other. Knowledge that should travel goes to team or org scope, which have their
+# own repos and their own gates. Local stays on the machine.
+.cambium/
 
 # Mirror byproducts: a retry queue, a conflict log and retrieval telemetry.
 # The store itself (.context/decisions.json, constraints.json) IS tracked; these
