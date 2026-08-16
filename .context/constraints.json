@@ -111,5 +111,40 @@
     "updated_at": "2026-08-16T17:51:16.730666+00:00",
     "verified_at": "2026-08-16T17:51:16.693169+00:00",
     "verified_sha": "603d6be33d2ba54214c47c9337c41a55203dc764"
+  },
+  {
+    "id": "con-005-22d0",
+    "rule": "A Cloudflare Worker that gates static assets MUST set `run_worker_first = true` under [assets], and every deploy must verify the gate by requesting a protected path WITHOUT the credential and asserting 404. Never deploy data before the gate has been proven on a data-free build.",
+    "reason": "Cloudflare serves a matching static asset BEFORE invoking the Worker script unless run_worker_first is set. A Worker whose fetch handler checks a path token therefore never runs for any path that matches an uploaded file, so the auth check is silently absent on exactly the URLs that matter. The failure presents as a completely normal successful deploy: wrangler reports success, the Worker exists, the code is correct, and the credential check is simply never reached. There is no error anywhere.",
+    "triggering_incident": "2026-08-16: deployed a token-gated dashboard Worker with [assets] pointing at a bundle containing snapshot.json - 869KB of cross-project memory with entry bodies from 20 projects, several private and one with no remote. The gate code was correct but never executed: https://<worker>.workers.dev/snapshot.json returned the full file to unauthenticated requests. Caught within about four minutes by the post-deploy gate test, which requested protected paths without the token and expected 404. Remediation had to be a deny-all Worker deployed over the same name, because `wrangler delete` left the edge serving the old assets for at least a minute. Worse, a --no-data build flag had been written specifically to prevent this and was used for an earlier Pages attempt, then skipped for the Worker deploy - the safety mechanism existed and was bypassed by the person who built it.",
+    "enforced_by": "",
+    "scope": "worker/wrangler.toml",
+    "hardness": "absolute",
+    "related_to": [
+      "dec-015-71d6",
+      "con-004-e3b9"
+    ],
+    "tags": [
+      "cloudflare",
+      "workers",
+      "auth",
+      "publishing",
+      "privacy",
+      "silent-failure"
+    ],
+    "retrieval_hints": [
+      "cloudflare worker assets bypass auth",
+      "run_worker_first",
+      "worker token gate not running",
+      "static assets served before worker",
+      "leaked snapshot via workers.dev"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-08-16T20:27:50.676194+00:00",
+    "updated_at": "2026-08-16T20:27:57.069769+00:00",
+    "verified_at": "2026-08-16T20:27:57.031415+00:00",
+    "verified_sha": "efd91c10daea3b8070115d381f7c966fb1404483"
   }
 ]

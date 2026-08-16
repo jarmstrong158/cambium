@@ -3952,6 +3952,31 @@ def _quality_gaps(project_dir, include_bodies):
 
 
 LAW_TAG = "xylem-law"      # marks a cross-project concept page in the knowledge store
+DECISIONS_FILE = "decisions.json"   # judgements made on the dashboard
+
+
+def _read_decisions(cfg):
+    """Judgements the operator has already made — dismissed link proposals, and
+    per-law rulings on candidate evidence.
+
+    A review surface that re-proposes what you already rejected is worse than
+    one that proposes nothing: it trains you to stop reading it. These are a
+    record of judgement, not a cache, so a dismissal stands until it is
+    explicitly reversed."""
+    path = os.path.join(os.path.dirname(cfg["local_store"]), DECISIONS_FILE)
+    if not os.path.exists(path):
+        return {"dismissed_links": [], "law_citations": {}, "law_dismissed": {}}
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {"dismissed_links": [], "law_citations": {}, "law_dismissed": {}}
+    if not isinstance(d, dict):
+        return {"dismissed_links": [], "law_citations": {}, "law_dismissed": {}}
+    d.setdefault("dismissed_links", [])
+    d.setdefault("law_citations", {})
+    d.setdefault("law_dismissed", {})
+    return d
 
 
 def _cited_ids(text):
@@ -3990,6 +4015,7 @@ def _lessons_block(cfg, include_bodies, mesh):
     notice or ask.
 
     `mesh` is {entry_id: (project, type, entry)} across every named project."""
+    decided = _read_decisions(cfg)
     scopes = [("local", _read_local(cfg)["items"])]
     try:
         scopes.append(("team", _read_team(cfg)))
@@ -4008,6 +4034,12 @@ def _lessons_block(cfg, include_bodies, mesh):
             if LAW_TAG not in tags or item.get("status") != "active":
                 continue
             cited = _cited_ids(item.get("content", "") + " " + item.get("why", ""))
+            # A candidate you have ruled on is settled either way: accepted
+            # means the law accounts for it, rejected means it never belonged.
+            # Both remove it from the work list; only the reason differs.
+            lid = item.get("id")
+            cited |= {e.lower() for e in decided["law_citations"].get(lid, [])}
+            cited |= {e.lower() for e in decided["law_dismissed"].get(lid, [])}
             topic = tags - {LAW_TAG, "cross-project"}
             # Score by how many of the law's topics an entry carries. A single
             # shared tag is weak — broad tags like `testing` or `architecture`
@@ -4136,7 +4168,8 @@ def _link_proposals(cfg):
         if u.get("project") in named:
             unpaired.setdefault(u["project"], []).append(u)
     return {"checked": True, "proposals": out, "unpaired": unpaired,
-            "threshold": data.get("threshold")}
+            "threshold": data.get("threshold"),
+            "dismissed": _read_decisions(cfg)["dismissed_links"]}
 
 
 def _project_snapshot(cfg, name, context_dir, pages, include_bodies,
@@ -4192,8 +4225,12 @@ def _project_links(links, name, include_bodies):
     if not links or not links.get("checked"):
         return {"checked": False, "proposals": None,
                 "reason": (links or {}).get("reason", "not run")}
+    dismissed = set(links.get("dismissed") or [])
     rows = []
     for prop in links.get("proposals", {}).get(name, []):
+        key = "%s:%s:%s" % (name, prop.get("newer_id"), prop.get("older_id"))
+        if key in dismissed:
+            continue          # you already said no; stop asking
         ev = prop.get("evidence", {})
         row = {
             "older_id": prop.get("older_id"),
