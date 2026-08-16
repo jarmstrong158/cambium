@@ -4187,6 +4187,15 @@ def _project_snapshot(cfg, name, context_dir, pages, include_bodies,
                 "updated_at": e.get("updated_at") or e.get("created_at") or ""}
         if include_bodies:
             node["title"] = _entry_title(rec)
+            node["tags"] = sorted({str(t).lower() for t in (e.get("tags") or [])})
+            # Enough of the entry to JUDGE it. A reviewer approving a candidate
+            # by id alone is approving something they cannot read, and the whole
+            # point of the review gate is that a human looked.
+            for field in ("problem", "why_chosen", "reason", "purpose"):
+                val = (e.get(field) or "").strip()
+                if val:
+                    node["excerpt"] = _demojibake(val)[:600]
+                    break
         nodes.append(node)
         target = e.get("superseded_by")
         if target:
