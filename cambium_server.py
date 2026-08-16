@@ -4180,23 +4180,28 @@ def _project_links(links, name, include_bodies):
             "older_id": prop.get("older_id"),
             "newer_id": prop.get("newer_id"),
             "kind": prop.get("kind"),
+            # `tier` is replacement evidence; `both_signals` was topic overlap
+            # being reported as evidence and measured 21.9% precision against
+            # 80% for `likely`. Kept only for snapshots written before the fix.
+            "tier": prop.get("tier", "lead"),
             "both_signals": bool(prop.get("both_signals")),
             "overlap_score": ev.get("overlap_score"),
             "shared_tags": ev.get("shared_tags") or [],
-            "strong_markers": ev.get("strong_markers") or [],
+            "replacement_signals": ev.get("replacement_signals") or [],
         }
         if include_bodies:
             row["older_summary"] = _demojibake(prop.get("older_summary") or "")
             row["newer_summary"] = _demojibake(prop.get("newer_summary") or "")
         rows.append(row)
-    # Strongest first: a pair where the newer entry's own text says something
-    # changed AND there is a sibling about the same subject to have changed from.
-    rows.sort(key=lambda r: (not r["both_signals"], -(r["overlap_score"] or 0),
+    # Evidence first: a pair where the newer entry actually names the older
+    # beside change language, then everything that merely shares a subject.
+    rows.sort(key=lambda r: (r["tier"] != "likely", -(r["overlap_score"] or 0),
                              r["older_id"] or ""))
     return {
         "checked": True,
         "proposals": rows,
         "count": len(rows),
+        "likely": sum(1 for r in rows if r["tier"] == "likely"),
         "both_signals": sum(1 for r in rows if r["both_signals"]),
         "unpaired_markers": len(links.get("unpaired", {}).get(name, [])),
         "note": "Proposals only. Nothing was written to any store — an edge "
@@ -4253,8 +4258,8 @@ def _build_snapshot(cfg, include_bodies=False):
             "laws": lessons["count"],
             "laws_behind": lessons["needs_update"],
             "link_proposals": sum(p["links"].get("count") or 0 for p in projects),
-            "link_proposals_strong": sum(
-                p["links"].get("both_signals") or 0 for p in projects),
+            "link_proposals_likely": sum(
+                p["links"].get("likely") or 0 for p in projects),
             "projects_without_link_survey": sum(
                 1 for p in projects if not p["links"]["checked"]),
         },
