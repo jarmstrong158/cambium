@@ -50,6 +50,24 @@ Config (environment, set in the MCP client config)
                              done/released transition, not only when a
                              full distill happens to catch them live
                                                                     (default: off)
+    CAMBIUM_PROJECTS         explicit project -> repo path map for the page tier
+                             and the snapshot exporter, as a JSON object or
+                             "name=/abs/path" pairs. Explicit rather than a
+                             filesystem scan: a store can only be read because
+                             someone named it.                      (optional)
+    CAMBIUM_CONTEXT_KEEPER   path to context-keeper's server.py (or its console
+                             script) so export_snapshot can run its
+                             verify_quality. Absent, the snapshot reports the
+                             quality scan as not-checked rather than clean.
+                                                                    (optional)
+
+Pages
+-----
+A fourth thing lives here alongside the three scopes: compiled synthesis pages
+(compile_page / compile_project / list_pages / recompile). Pages are BUILD
+ARTIFACTS, not knowledge — they live in .cambium/pages.json, never in
+knowledge.json, so they cannot be recalled, promoted, or cited as a source, and
+deleting the file loses nothing that .context/ cannot rebuild.
 """
 
 import hashlib
@@ -57,6 +75,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -87,6 +106,19 @@ mcp = MCPServer(
 KNOWLEDGE_FILE = "knowledge.json"
 KNOWLEDGE_MD = "KNOWLEDGE.md"   # human-readable render of a knowledge store
 LOCAL_DIR = ".cambium"
+# Pages live in their OWN file, never in knowledge.json. A page is a build
+# artifact compiled from context-keeper entries: deletable, regenerable, and —
+# critically — outside every trust-tier read. recall(), session_primer(),
+# export_markdown(), stale_report() and review_promotions() all iterate
+# data["items"], so a page stored there would be recallable AND promotable, i.e.
+# a derived summary could climb to org scope and be cited as a source. Keeping
+# pages in a separate file makes that impossible by construction rather than by
+# a filter every future read has to remember to apply.
+PAGES_FILE = "pages.json"
+# Stamped into every exported markdown page's frontmatter. export_pages reaps
+# stale files from its output directory, so it needs a way to tell its own
+# output from a note a human put there — the marker is that proof.
+PAGES_MARKER = "cambium:export_pages"
 PUSH_RETRIES = 5
 RELEVANCE_FLOOR = 0.2  # below this, recall says "no confident match"
 
@@ -212,6 +244,52 @@ def _git_root(start=None):
     return ""
 
 
+def _projects_map(file_cfg):
+    """The explicit project -> repo-path map used by the page tier and the
+    snapshot exporter.
+
+    cambium is otherwise configured one repo at a time (cfg["project"] is just
+    the basename of CAMBIUM_REPO), so anything that spans projects — a page
+    compiled for another repo, a snapshot listing every project — has no way to
+    resolve a project NAME to a store. This map is that resolution, and it is
+    deliberately EXPLICIT rather than a filesystem scan: the alternative is
+    walking a root and reading every .context/ it finds, which silently pulls in
+    private repos and local-only projects. An operator who has to name a project
+    to include it cannot be surprised by what got read (see con-015-12da in
+    context-keeper, and the dashboard.html gitignore rule here).
+
+    Accepts a JSON object (from the config file, or as an env string) or the
+    compact "name=path,name=path" form. Bad shapes are dropped, never raised —
+    a typo in one entry must not take down every tool that reads config."""
+    raw = _resolve("CAMBIUM_PROJECTS", file_cfg, "")
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        pairs = raw.items()
+    else:
+        text = str(raw).strip()
+        if text.startswith("{"):
+            try:
+                loaded = json.loads(text)
+            except json.JSONDecodeError:
+                return {}
+            pairs = loaded.items() if isinstance(loaded, dict) else []
+        else:
+            # "name=path" separated by commas or newlines. Paths hold ':' and
+            # ';' on Windows, so neither is usable as the separator here.
+            pairs = []
+            for chunk in text.replace("\n", ",").split(","):
+                if "=" in chunk:
+                    name, _, path = chunk.partition("=")
+                    pairs.append((name, path))
+    out = {}
+    for name, path in pairs:
+        name, path = str(name).strip(), str(path).strip()
+        if name and path:
+            out[name] = _abspath(path)
+    return out
+
+
 def _cfg():
     """Resolved config dict, or ConfigError if a required setting is missing or
     the repo isn't a git clone. Tools call this via _require_cfg() so the error
@@ -246,7 +324,9 @@ def _cfg():
         "mode": (_resolve("CAMBIUM_MODE", file_cfg, "auto") or "auto").lower(),
         "worktree": os.path.join(repo, ".git", "cambium-wt"),
         "local_store": os.path.join(repo, LOCAL_DIR, KNOWLEDGE_FILE),
+        "pages_store": os.path.join(repo, LOCAL_DIR, PAGES_FILE),
         "context_dir": os.path.join(repo, ".context"),
+        "projects": _projects_map(file_cfg),
     }
 
 
@@ -2635,6 +2715,1640 @@ def status() -> str:
 
 
 # --------------------------------------------------------------------------- #
+# pages — a synthesis tier compiled FROM context-keeper entries
+#
+# A page is a build artifact, not a source. Three properties define it, and each
+# one is enforced somewhere rather than merely intended:
+#
+#   deletable/regenerable : pages.json can be deleted and every page rebuilt
+#                           from .context/ alone. Nothing is authored here, so
+#                           nothing can be lost here.
+#   never a trust-tier read : pages live outside knowledge.json (see PAGES_FILE)
+#                           and cambium never writes .context/, so a page can
+#                           reach neither recall() nor reload_constraints().
+#   computed staleness    : a page carries the exact entry ids it compiled from
+#                           plus each one's status and CONTENT HASH, so "is this
+#                           page still true" is answered by comparison, never by
+#                           a heuristic or an age threshold.
+#
+# Why a content hash and not just updated_at: context-keeper's stores are
+# documented as human-editable JSON and are edited by hand in practice, so a
+# body can change with no timestamp bump — timestamp-only staleness would report
+# a page green while its sources had moved. The reverse also happens:
+# _backfill_updated_at stamps updated_at onto entries that never changed. The
+# hash is authoritative; updated_at is kept for display and corroboration only.
+# --------------------------------------------------------------------------- #
+
+# (filename, type name, title field). Pages read all THREE entry kinds —
+# distill() reads only decisions and constraints, so pages are deliberately a
+# superset of what cambium imports as knowledge.
+ENTRY_FILES = (("decisions.json", "decisions", "summary"),
+               ("constraints.json", "constraints", "rule"),
+               ("pipelines.json", "pipelines", "name"))
+
+# Fields excluded from an entry's content hash: lifecycle and bookkeeping that
+# either has its own staleness cause (status, superseded_by) or moves without
+# the entry's meaning changing (verified_at refreshes, mirror touches, the
+# updated_at backfill). Everything else is hashed — including fields added by
+# future schema versions, so a new field makes pages stale and asks a human to
+# look, which is the safe direction for a staleness detector to fail in.
+_HASH_EXCLUDED = frozenset((
+    "created_at", "updated_at", "verified_at", "verified_sha",
+    "status", "superseded_by", "schema_version",
+))
+
+PAGE_TOPIC_FLOOR = 0.34   # min token overlap for a topic selector to take an entry
+PAGE_MIN_CLUSTER = 2      # tags with fewer active entries than this get no page
+
+
+def _pages_context_dir(cfg, project):
+    """Resolve a project name to its .context/ directory, or raise ConfigError
+    with the list of names that WOULD work. Falls back to the configured repo
+    when the caller names it (or names nothing), so single-project use needs no
+    CAMBIUM_PROJECTS map at all."""
+    if not project or project == cfg["project"]:
+        return cfg["project"], cfg["context_dir"]
+    path = cfg["projects"].get(project)
+    if not path:
+        known = sorted(set(list(cfg["projects"]) + [cfg["project"]]))
+        raise ConfigError(
+            "unknown project %r. Known projects: %s. Add it with "
+            "CAMBIUM_PROJECTS (\"name=/abs/path\" pairs, or a JSON object) so "
+            "cambium can resolve the name to a store." % (project, ", ".join(known)))
+    return project, os.path.join(path, ".context")
+
+
+def _entry_content_hash(entry):
+    """Stable hash of an entry's MEANING. Sorted keys so dict order in the file
+    can't change it; ensure_ascii=False so an em-dash hashes as itself rather
+    than as its escape."""
+    body = {k: v for k, v in entry.items() if k not in _HASH_EXCLUDED}
+    blob = json.dumps(body, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+
+
+def _read_entries(context_dir):
+    """All entries in a .context/ store as {entry_id: (type_name, title_field,
+    entry)}. Reads only the three entry files by name — .context/ also holds
+    usage.json, embeddings.json and .mirror_conflicts.json, which are
+    per-machine telemetry, not entries."""
+    out = {}
+    for fname, tname, title_f in ENTRY_FILES:
+        path = os.path.join(context_dir, fname)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                entries = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        for e in entries if isinstance(entries, list) else []:
+            if isinstance(e, dict) and e.get("id"):
+                out[e["id"]] = (tname, title_f, e)
+    return out
+
+
+def _entry_title(record):
+    tname, title_f, e = record
+    return _demojibake(e.get(title_f) or e.get("summary") or e.get("id") or "?")
+
+
+def _entry_text(record):
+    """Everything about an entry a topic query could reasonably match."""
+    _tname, _title_f, e = record
+    parts = [str(e.get(k, "")) for k in (
+        "summary", "rule", "name", "problem", "why_chosen", "reason",
+        "purpose", "what_we_tried", "tradeoffs", "triggering_incident",
+        "when_to_invoke")]
+    parts += [str(t) for t in e.get("tags", [])]
+    parts += [str(h) for h in e.get("retrieval_hints", [])]
+    return " ".join(p for p in parts if p)
+
+
+def _entry_is_active(record):
+    return (record[2].get("status") or "active") == "active"
+
+
+def _select_entries(entries, tag="", topic=""):
+    """Pick the ACTIVE entries a page compiles from, plus the candidate count
+    (every active entry in the store). The denominator is recorded because a
+    tag-selected page is silently partial by nature — tags are free-form and
+    context-keeper's own verify_quality flags a no_tags population — so a page
+    that says "7 of 31" is honest where a bare list of 7 is not."""
+    active = {eid: rec for eid, rec in entries.items() if _entry_is_active(rec)}
+    if tag:
+        want = tag.strip().lower()
+        chosen = {eid: rec for eid, rec in active.items()
+                  if want in {str(t).lower() for t in rec[2].get("tags", [])}}
+    elif topic:
+        q = _tokens(topic)
+        chosen = {}
+        for eid, rec in active.items():
+            hay = _tokens(_entry_text(rec))
+            if not q:
+                continue
+            hits = sum(1 for t in q if t in hay
+                       or any(w.startswith(t) or t.startswith(w)
+                              for w in hay if len(w) >= 3 and len(t) >= 3))
+            if hits / len(q) >= PAGE_TOPIC_FLOOR:
+                chosen[eid] = rec
+        # An untagged entry can still match a topic query, which is exactly why
+        # topic pages exist alongside tag pages.
+    else:
+        chosen = dict(active)
+    return chosen, len(active)
+
+
+def _page_slug(text):
+    s = re.sub(r"[^a-z0-9]+", "-", str(text).strip().lower()).strip("-")
+    return s or "page"
+
+
+def _related_slugs(own_slug, own_ids, others, index_slug=None, limit=12):
+    """Pages genuinely related to this one: they share at least one entry, or an
+    entry here names an entry there.
+
+    Not "every other page in the project". Linking to all siblings produced
+    17,488 wikilinks across 221 pages — about 79 per page — which in a vault is
+    a hairball and in a backlinks panel is noise. A link that is always present
+    says nothing; these say "the same decision appears on both of these".
+
+    `others` is {slug: set(entry_ids)}. The index is always included, because
+    that link is navigation rather than a claim about relatedness."""
+    scored = []
+    for slug, ids in others.items():
+        if slug == own_slug or not ids:
+            continue
+        shared = own_ids & ids
+        if shared:
+            scored.append((len(shared), slug))
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    out = [slug for _n, slug in scored[:limit]]
+    if index_slug and index_slug != own_slug:
+        out.append(index_slug)
+    return out
+
+
+def _cluster_tally(active, floor=None):
+    """tag -> {entry ids}, keeping only tags at or above the cluster floor."""
+    floor = PAGE_MIN_CLUSTER if floor is None else floor
+    tally = {}
+    for eid, rec in active.items():
+        for t in rec[2].get("tags", []):
+            tally.setdefault(str(t).lower(), set()).add(eid)
+    return {t: ids for t, ids in tally.items() if len(ids) >= floor}
+
+
+def _unfiled_ids(entries, floor=None):
+    """Active entries no cluster page covers — the population an `unfiled` page
+    exists to make visible.
+
+    The floor is passed in rather than assumed, and compile_project records it
+    on the selector: a project built with min_cluster=3 has a different uncovered
+    set than the default, and a staleness check using the wrong floor would
+    report drift that never happened."""
+    active = {eid: rec for eid, rec in entries.items() if _entry_is_active(rec)}
+    covered = {eid for ids in _cluster_tally(active, floor).values() for eid in ids}
+    return set(active) - covered
+
+
+def _selector_matches(selector, entries):
+    """The entry ids a selector SHOULD cover right now, or None when the
+    selector is not a function of entries at all.
+
+    None is the important return: an `index` page summarises other pages and has
+    no entry sources, so re-running a selector over it would report every entry
+    in the project as newly matching. That is exactly what happened the first
+    time this shipped — every index and unfiled page came out stale the instant
+    it was compiled, because both fell through to the "no tag, no topic, so
+    match everything" branch of _select_entries."""
+    kind = selector.get("kind")
+    if kind == "tag":
+        chosen, _ = _select_entries(entries, tag=selector.get("value", ""))
+        return set(chosen)
+    if kind == "topic":
+        chosen, _ = _select_entries(entries, topic=selector.get("value", ""))
+        return set(chosen)
+    if kind == "unfiled":
+        return _unfiled_ids(entries, selector.get("floor"))
+    if kind == "all":
+        chosen, _ = _select_entries(entries)
+        return set(chosen)
+    return None   # index, and any future selector with no entry basis
+
+
+def _source_record(eid, record, role="primary"):
+    """A page's record of one source entry.
+
+    `role` distinguishes the entries the selector CHOSE (primary) from the ones
+    pulled in to build an arc — a superseded predecessor quoted in the "was X,
+    changed because Y" line (context). The distinction is load-bearing for
+    staleness: a context source is superseded BY DEFINITION, so treating its
+    status as a staleness cause would make every page with any history on it
+    permanently stale. Its content is still hashed, because if the predecessor's
+    text is edited the page's rendered body changes and the page really is out
+    of date."""
+    tname, _title_f, e = record
+    return {
+        "entry_id": eid,
+        "type": tname,
+        "role": role,
+        "status": e.get("status") or "active",
+        "updated_at": e.get("updated_at") or e.get("created_at") or "",
+        "content_hash": _entry_content_hash(e),
+    }
+
+
+def _ref(eid, entries, entries_on_page=frozenset()):
+    """Render a cross-reference as a STATEMENT, not a bare id.
+
+    The whole difference between a log and a synthesis lives here: the stores
+    carry a graph — related_to, constraints_created, superseded_by — and every
+    edge is an id sitting inert in the JSON. Resolving one to its subject is how
+    a page says something no single entry says."""
+    rec = entries.get(eid)
+    if rec is None:
+        return f"`{eid}` *(not in this store)*", False
+    title = _oneline(_entry_title(rec))
+    if len(title) > 120:
+        title = title[:119].rstrip() + "…"
+    here = " (on this page)" if eid in entries_on_page else ""
+    return f"`{eid}` — {title}{here}", True
+
+
+def _predecessors(eid, entries):
+    """Entries this one replaced: anything whose superseded_by points at it.
+
+    Reads the edge from the OLD entry, which is where context-keeper writes it,
+    rather than expecting a `supersedes` list on the new one."""
+    out = []
+    for other_id, rec in entries.items():
+        if rec[2].get("superseded_by") == eid and other_id != eid:
+            out.append(other_id)
+    return sorted(out)
+
+
+def _predecessor_line(old_id, old_rec, new_rec):
+    """One compact line of change history, in context-keeper's own format
+    (server.py::_predecessor_line) so the two surfaces read identically."""
+    was = _oneline(_demojibake(_entry_title(old_rec)))
+    if len(was) > 140:
+        was = was[:139].rstrip() + "…"
+    why = (old_rec[2].get("deprecated_reason")
+           or new_rec[2].get("problem") or "").strip()
+    why = _oneline(_demojibake(why))
+    if len(why) > 200:
+        why = why[:199].rstrip() + "…"
+    line = f'supersedes `{old_id}`: was "{was}"'
+    return line + (f" — changed because: {why}" if why else "")
+
+
+def _rendered_refs(chosen, entries):
+    """Every entry whose TEXT the body renders but the selector did not choose.
+
+    The invariant this exists to keep: a page tracks every entry it quotes. The
+    body resolves references to titles, so an entry can reach the page through
+    `related_to`, `constraints_created`, or a supersession edge without ever
+    being selected — and an untracked quote is drift the staleness check cannot
+    see. One level deep only; a resolved reference's own references are that
+    page's business, not this one's."""
+    extra = set()
+    for eid in chosen:
+        extra.update(_predecessors(eid, entries))
+        e = chosen[eid][2]
+        for field in ("related_to", "constraints_created"):
+            for ref in (e.get(field) or []):
+                if ref in entries:
+                    extra.add(ref)
+        # a constraint names the decision that created it, wherever that lives
+        if chosen[eid][0] == "constraints":
+            for other_id, rec in entries.items():
+                if eid in (rec[2].get("constraints_created") or []):
+                    extra.add(other_id)
+    return extra - set(chosen)
+
+
+def _constraint_origins(eid, entries):
+    """Decisions whose constraints_created names this constraint — searched
+    across the whole store, because the decision that produced a rule is worth
+    naming even once it has itself been superseded."""
+    return sorted(d for d, rec in entries.items()
+                  if eid in (rec[2].get("constraints_created") or []))
+
+
+def _page_tensions(chosen, entries, selector=None):
+    """Cross-entry problems a page can assert deterministically.
+
+    Deliberately only two checks, both cheap to justify:
+      * a reference pointing at an id that is not in the store — always a real
+        defect, never a matter of taste;
+      * entries on this page sharing two or more tags with no link either way —
+        a heuristic, so it is phrased as something to look at rather than a
+        finding, and it is capped so a big cluster cannot bury the page.
+
+    Deliberately NOT here: anything verify_quality already owns (thin reasons,
+    missing tags, code drift, enforced_by resolution). Two tools computing the
+    same judgement is how they come to disagree."""
+    out = []
+    for eid in sorted(chosen):
+        e = chosen[eid][2]
+        for field in ("related_to", "constraints_created"):
+            for ref in (e.get(field) or []):
+                # constraints_created legitimately holds prose descriptions of a
+                # rule as well as ids; only id-shaped values are checked.
+                if not re.match(r"^(dec|con|pipe)-", str(ref)):
+                    continue
+                if ref not in entries:
+                    out.append(f"`{eid}` names {field} `{ref}`, which is not in "
+                               "this store — the link is dead")
+    # Every entry on a tag page shares the selector's tag BY CONSTRUCTION, so
+    # counting it toward "shared tags" turns a >=2 threshold into >=1 and floods
+    # the page. On the real stores that flagged 143 of 221 pages — a signal that
+    # fires almost everywhere is not a signal.
+    free = {(selector or {}).get("value", "").lower()} if (
+        selector or {}).get("kind") == "tag" else set()
+    pairs = []
+    ids = sorted(chosen)
+    for i, a in enumerate(ids):
+        ta = {str(t).lower() for t in chosen[a][2].get("tags", [])} - free
+        la = set(chosen[a][2].get("related_to") or [])
+        for b in ids[i + 1:]:
+            tb = {str(t).lower() for t in chosen[b][2].get("tags", [])} - free
+            lb = set(chosen[b][2].get("related_to") or [])
+            shared = ta & tb
+            if len(shared) >= 2 and a not in lb and b not in la:
+                pairs.append((a, b, sorted(shared)))
+    for a, b, shared in pairs[:5]:
+        out.append(f"`{a}` and `{b}` share {', '.join(shared)} but neither links "
+                   "the other — possibly one arc recorded as two entries")
+    if len(pairs) > 5:
+        out.append(f"…and {len(pairs) - 5} more unlinked pairs on this page")
+    return out
+
+
+def _entry_created(rec):
+    return rec[2].get("created_at") or ""
+
+
+def _ordered_steps(steps):
+    """Pipeline steps as ordered strings, tolerating both shapes found in real
+    stores: {order, action} objects and bare strings. Objects sort by `order`;
+    strings keep their list position, since that IS their order."""
+    if not isinstance(steps, list):
+        return []
+    dicts = [s for s in steps if isinstance(s, dict)]
+    if dicts:
+        dicts.sort(key=lambda s: s.get("order") or 0)
+        return [_demojibake(str(s.get("action") or s.get("output") or "")).strip()
+                for s in dicts]
+    return [_demojibake(str(s)).strip() for s in steps if str(s).strip()]
+
+
+def _render_page_body(project, title, selector, chosen, candidate_count,
+                      related_slugs, entries):
+    """Deterministic markdown, structured BY ROLE rather than by entry order.
+
+    The page answers three questions in the order someone actually asks them —
+    what is in force, how it came to be decided, what changed — instead of
+    listing entries as they happen to sit in the file. Everything that makes it
+    a synthesis rather than a reformat comes from the graph BETWEEN entries:
+    references resolved to their subject, supersession rendered as a change
+    line, and cross-entry problems asserted at the end. No sentence here is
+    invented; the assembly is what is new.
+
+    Carries NO timestamp: compiled_at lives in the page record, so an unchanged
+    store recompiles to a byte-identical body (context-keeper's export_snapshot
+    made the same choice for the same reason)."""
+    on_page = frozenset(chosen)
+    lines = [f"# {_demojibake(title)}", ""]
+    sel = (f"tag `{selector['value']}`" if selector["kind"] == "tag"
+           else f"topic “{selector['value']}”" if selector["kind"] == "topic"
+           else "entries no cluster covers" if selector["kind"] == "unfiled"
+           else "all active entries")
+    lines += [
+        f"*Compiled from {len(chosen)} of {candidate_count} active entries in "
+        f"`{project}`, selected by {sel}.*", "",
+        "> This page is a build artifact. Edit the entries, not this file — it "
+        "is regenerated from `.context/` and any edit here is lost on recompile.",
+        "",
+    ]
+
+    by_type = {}
+    for eid, rec in chosen.items():
+        by_type.setdefault(rec[0], []).append((eid, rec))
+
+    def field_block(e, pairs):
+        out = []
+        for field, heading in pairs:
+            val = (e.get(field) or "").strip()
+            if val:
+                out += [f"**{heading}:** {_demojibake(val)}", ""]
+        return out
+
+    # --- rules in force ---------------------------------------------------- #
+    # Constraints lead, because they are the part that governs what you may do
+    # next. Buried in entry order they read as trivia; at the top they read as
+    # the operative rules they are.
+    cons = sorted(by_type.get("constraints", []), key=lambda p: p[0])
+    if cons:
+        lines += ["## Rules in force", ""]
+        for eid, rec in cons:
+            e = rec[2]
+            bits = [b for b in (e.get("hardness") or "",
+                                f"scope `{e['scope']}`" if e.get("scope") else "")
+                    if b]
+            head = f"### {_entry_title(rec)}  `{eid}`"
+            lines += [head, ""]
+            if bits:
+                lines += ["*" + " · ".join(bits) + "*", ""]
+            if e.get("enforced_by"):
+                lines += [f"Enforced by `{_demojibake(e['enforced_by'])}`.", ""]
+            lines += field_block(e, (("reason", "Why"),
+                                     ("triggering_incident", "What happened")))
+            # The decision that produced this rule, named — the single most
+            # useful edge in the store and the one nothing was following.
+            for d in _constraint_origins(eid, entries):
+                text, _ok = _ref(d, entries, on_page)
+                lines += [f"Created by {text}", ""]
+
+    # --- how it got decided ------------------------------------------------ #
+    decs = sorted(by_type.get("decisions", []),
+                  key=lambda p: (_entry_created(p[1]), p[0]))
+    if decs:
+        lines += ["## How this got decided", ""]
+        for eid, rec in decs:
+            e = rec[2]
+            lines += [f"### {_entry_title(rec)}  `{eid}`", ""]
+            # Change history inline: what this replaced and why it moved.
+            for old in _predecessors(eid, entries):
+                lines += [_predecessor_line(old, entries[old], rec), ""]
+            lines += field_block(e, (("problem", "Problem"),
+                                     ("why_chosen", "Why"),
+                                     ("what_we_tried", "What we tried"),
+                                     ("tradeoffs", "Tradeoffs")))
+            for field, heading in (("constraints_created", "Rules this created"),
+                                   ("related_to", "Related")):
+                refs = [r for r in (e.get(field) or []) if r]
+                if not refs:
+                    continue
+                lines.append(f"**{heading}:**")
+                for r in sorted(refs):
+                    text, _ok = _ref(r, entries, on_page)
+                    lines.append(f"- {text}")
+                lines.append("")
+
+    # --- pipelines --------------------------------------------------------- #
+    pipes = sorted(by_type.get("pipelines", []), key=lambda p: p[0])
+    if pipes:
+        lines += ["## Pipelines", ""]
+        for eid, rec in pipes:
+            e = rec[2]
+            lines += [f"### {_entry_title(rec)}  `{eid}`", ""]
+            lines += field_block(e, (("purpose", "Purpose"),
+                                     ("when_to_invoke", "When to invoke")))
+            # steps are documented as {order, action, output} objects, but real
+            # stores also carry plain strings (older entries, hand-edited ones).
+            # A synthesis layer reads what is THERE, not what the schema says.
+            for n, s in enumerate(_ordered_steps(e.get("steps")), start=1):
+                lines.append(f"{n}. {s}")
+            lines.append("")
+
+    # --- what changed ------------------------------------------------------ #
+    # The superseded entries behind everything above, gathered in one place so
+    # the arc is legible without the retired text competing with what is current.
+    history = []
+    for eid, _rec in decs + cons:
+        for old in _predecessors(eid, entries):
+            history.append((old, eid))
+    if history:
+        lines += ["## What changed", ""]
+        for old, new in sorted(set(history)):
+            old_text, _ = _ref(old, entries, on_page)
+            new_text, _ = _ref(new, entries, on_page)
+            lines.append(f"- {old_text} → replaced by {new_text}")
+        lines.append("")
+
+    # --- worth a look ------------------------------------------------------ #
+    tensions = _page_tensions(chosen, entries, selector)
+    if tensions:
+        lines += ["## Worth a look", "",
+                  "*Detected across entries, not asserted by any one of them.*",
+                  ""]
+        lines += [f"- {t}" for t in tensions]
+        lines.append("")
+
+    if related_slugs:
+        lines += ["## Related pages", ""]
+        lines += [f"- [[{s}]]" for s in sorted(related_slugs)]
+        lines.append("")
+    # `"Sources: " + x or "none"` binds as `("Sources: " + x) or "none"`, and a
+    # non-empty prefix is always truthy — the fallback could never fire.
+    refs = ", ".join(f"`{eid}`" for eid in sorted(chosen))
+    lines += ["---", "", "Sources: " + (refs if refs else "none"), ""]
+    return "\n".join(lines)
+
+
+def _empty_pages():
+    return {"pages": []}
+
+
+def _read_pages(cfg):
+    path = cfg["pages_store"]
+    if not os.path.exists(path):
+        return _empty_pages()
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        # Unlike knowledge.json there is nothing to quarantine and nothing to
+        # lose: pages are wholly derived, so a corrupt store is repaired by
+        # recompiling. Starting clean IS the recovery.
+        return _empty_pages()
+    if not isinstance(data, dict):
+        return _empty_pages()
+    data.setdefault("pages", [])
+    return data
+
+
+def _write_pages(cfg, data):
+    _atomic_write_json(cfg["pages_store"], data)
+
+
+def _build_page(project, title, selector, chosen, candidate_count,
+                related_slugs, entries=None):
+    """Assemble a page record. `identity` is the idempotence key: body plus the
+    exact source fingerprints, deliberately EXCLUDING compiled_at. Two compiles
+    of an unchanged store produce equal identities and unequal compiled_at, so
+    "recompile changed nothing" is a testable claim rather than a hope."""
+    entries = chosen if entries is None else entries
+    body = _render_page_body(project, title, selector, chosen,
+                             candidate_count, related_slugs, entries)
+    sources = [_source_record(eid, rec) for eid, rec in chosen.items()]
+    # Everything the body quotes but the selector did not choose — predecessors
+    # in the change lines, and entries a resolved reference names. The page's
+    # body contains their text, so a page that did not track them could render
+    # stale quotes and still report itself clean. Marked `context` so a
+    # predecessor's (inevitable) superseded status is not itself a cause.
+    for eid in sorted(_rendered_refs(chosen, entries)):
+        sources.append(_source_record(eid, entries[eid], role="context"))
+    seen, deduped = set(), []
+    for s in sorted(sources, key=lambda s: (s["entry_id"], s["role"])):
+        if s["entry_id"] in seen:
+            continue
+        seen.add(s["entry_id"])
+        deduped.append(s)
+    sources = deduped
+    body_hash = hashlib.sha1(body.encode("utf-8")).hexdigest()
+    ident = hashlib.sha1(
+        (body_hash + json.dumps(sources, sort_keys=True)).encode("utf-8")
+    ).hexdigest()
+    return {
+        "id": "page-" + _page_slug(f"{project}-{selector['value'] or 'all'}"),
+        "project": project,
+        "title": title,
+        "slug": _page_slug(f"{project}-{selector['value'] or 'all'}"),
+        "selector": selector,
+        "sources": sources,
+        "candidate_count": candidate_count,
+        "body": body,
+        "body_hash": body_hash,
+        "identity": ident,
+        "compiled_at": _now(),
+    }
+
+
+def _page_staleness(page, entries):
+    """Compare a page's recorded sources against the store as it is NOW.
+
+    Returns (stale, causes). Every cause names the entry that caused it, because
+    "this page is stale" without the offending id just moves the search to the
+    human. Causes are ordered by entry id so the report is stable."""
+    causes = []
+    for src in page.get("sources", []):
+        eid = src["entry_id"]
+        rec = entries.get(eid)
+        if rec is None:
+            causes.append({"entry_id": eid, "cause": "orphaned",
+                           "detail": "source entry no longer exists in the store"})
+            continue
+        e = rec[2]
+        status = e.get("status") or "active"
+        if src.get("role") == "context":
+            # Quoted history. It is superseded because that is why it is on the
+            # page; only an edit to its text (or its disappearance, handled
+            # above) changes what the page says.
+            if _entry_content_hash(e) != src.get("content_hash"):
+                causes.append({"entry_id": eid, "cause": "changed",
+                               "detail": "quoted predecessor's content changed"})
+            continue
+        if status == "superseded":
+            causes.append({"entry_id": eid, "cause": "superseded",
+                           "detail": "superseded by %s" % (e.get("superseded_by") or "?")})
+        elif status == "deprecated":
+            causes.append({"entry_id": eid, "cause": "deprecated",
+                           "detail": "entry was deprecated"
+                                     + (" in favour of %s" % e["superseded_by"]
+                                        if e.get("superseded_by") else "")})
+        elif _entry_content_hash(e) != src.get("content_hash"):
+            # Body moved. Note this fires whether or not updated_at moved with
+            # it — a hand edit that never bumped the timestamp still lands here.
+            causes.append({"entry_id": eid, "cause": "changed",
+                           "detail": "entry content changed since compile"})
+    # A page can also go stale by OMISSION: an entry recorded after the compile
+    # that the selector now matches belongs on the page and isn't there. Pure
+    # source-diffing never sees this, and it is the common case for a tag page
+    # on an active project.
+    expected = _selector_matches(page.get("selector") or {}, entries)
+    if expected is not None:
+        # Compared against the PRIMARY sources only: context sources are quoted
+        # history, not things the selector chose.
+        known = {s["entry_id"] for s in page.get("sources", [])
+                 if s.get("role", "primary") == "primary"}
+        for eid in sorted(expected - known):
+            causes.append({"entry_id": eid, "cause": "new_match",
+                           "detail": "entry now matches this page's selector"})
+    causes.sort(key=lambda c: (c["entry_id"], c["cause"]))
+    return (bool(causes), causes)
+
+
+def _compile_one(cfg, project, context_dir, title, selector, related_slugs=()):
+    entries = _read_entries(context_dir)
+    chosen, candidates = _select_entries(
+        entries,
+        tag=selector["value"] if selector["kind"] == "tag" else "",
+        topic=selector["value"] if selector["kind"] == "topic" else "")
+    return _build_page(project, title, selector, chosen, candidates,
+                       related_slugs, entries)
+
+
+def _upsert_page(data, page):
+    """Replace by id, preserving list order so pages.json diffs stay readable."""
+    for i, existing in enumerate(data["pages"]):
+        if existing.get("id") == page["id"]:
+            data["pages"][i] = page
+            return "recompiled"
+    data["pages"].append(page)
+    return "compiled"
+
+
+def _page_view(page, stale, causes):
+    """The list/report shape: everything but the body, which is large and is
+    what the markdown file is for."""
+    return {
+        "id": page["id"],
+        "project": page["project"],
+        "title": page["title"],
+        "selector": page["selector"],
+        "sources": [s["entry_id"] for s in page.get("sources", [])],
+        "source_count": len(page.get("sources", [])),
+        "candidate_count": page.get("candidate_count"),
+        "compiled_at": page.get("compiled_at"),
+        "stale": stale,
+        "stale_causes": causes,
+    }
+
+
+@mcp.tool()
+def compile_page(project: str = "", tag: str = "", topic: str = "",
+                 title: str = "") -> str:
+    """Compile ONE synthesis page from a project's context-keeper entries,
+    selected by tag or by topic.
+
+    The page is a build artifact: it is stored apart from cambium's knowledge
+    items, is never returned by recall() or any trust-tier read, and can be
+    deleted and rebuilt from .context/ at any time. It records the exact entry
+    ids it compiled from together with each entry's status and content hash, so
+    staleness is computed by comparison rather than guessed from age.
+
+    Pass `tag` for an exact tag match or `topic` for a free-text match; with
+    neither, the page covers every active entry in the project. `project`
+    defaults to the configured repo — naming another one requires it to be in
+    the CAMBIUM_PROJECTS map."""
+    cfg, err = _require_cfg()
+    if err:
+        return err
+    if tag and topic:
+        return json.dumps({"error": "pass tag OR topic, not both"}, indent=2)
+    try:
+        project, context_dir = _pages_context_dir(cfg, project)
+    except ConfigError as e:
+        return json.dumps({"error": str(e)}, indent=2)
+    if not os.path.isdir(context_dir):
+        return json.dumps({
+            "error": f"no context-keeper store at {context_dir}",
+            "fix": "pages compile FROM context-keeper entries; record some "
+                   "first, or point CAMBIUM_PROJECTS at the right clone.",
+        }, indent=2)
+
+    selector = ({"kind": "tag", "value": tag.strip()} if tag
+                else {"kind": "topic", "value": topic.strip()} if topic
+                else {"kind": "all", "value": ""})
+    label = title.strip() or tag.strip() or topic.strip() or f"{project} — all entries"
+    data = _read_pages(cfg)
+    # A page never links to itself, so its own slug is excluded BEFORE compiling
+    # — the links are part of the body, and a body that linked to itself would
+    # differ from the same page compiled fresh.
+    own_slug = _page_slug(f"{project}-{selector['value'] or 'all'}")
+    entries_now = _read_entries(context_dir)
+    own_ids = set(_select_entries(
+        entries_now,
+        tag=selector["value"] if selector["kind"] == "tag" else "",
+        topic=selector["value"] if selector["kind"] == "topic" else "")[0])
+    others = {p["slug"]: {s["entry_id"] for s in p.get("sources", [])}
+              for p in data["pages"]
+              if p.get("project") == project and p.get("slug")}
+    index_slug = _page_slug(f"{project}-index")
+    siblings = _related_slugs(own_slug, own_ids, others,
+                              index_slug if index_slug in others else None)
+    page = _compile_one(cfg, project, context_dir, label, selector, siblings)
+    action = _upsert_page(data, page)
+    _write_pages(cfg, data)
+    entries = _read_entries(context_dir)
+    stale, causes = _page_staleness(page, entries)
+    return json.dumps({
+        "status": action,
+        "page": _page_view(page, stale, causes),
+        "body_preview": page["body"][:600],
+        "store": cfg["pages_store"],
+    }, indent=2)
+
+
+@mcp.tool()
+def compile_project(project: str = "", min_cluster: int = 0) -> str:
+    """Compile a whole project: one page per tag cluster, plus an index page
+    that links them with wikilinks.
+
+    Clusters are tags carrying at least `min_cluster` active entries (default
+    2). Entries that no cluster covers are compiled into an explicit "unfiled"
+    page rather than dropped — an untagged entry is invisible to tag selection,
+    and a synthesis layer that silently omits part of the store is worse than
+    one that shows the gap."""
+    cfg, err = _require_cfg()
+    if err:
+        return err
+    try:
+        project, context_dir = _pages_context_dir(cfg, project)
+    except ConfigError as e:
+        return json.dumps({"error": str(e)}, indent=2)
+    if not os.path.isdir(context_dir):
+        return json.dumps({"error": f"no context-keeper store at {context_dir}"},
+                          indent=2)
+    floor = min_cluster if min_cluster > 0 else PAGE_MIN_CLUSTER
+    entries = _read_entries(context_dir)
+    active = {eid: rec for eid, rec in entries.items() if _entry_is_active(rec)}
+
+    tally = _cluster_tally(active, floor)
+    clusters = sorted(tally)
+    covered = {eid for ids in tally.values() for eid in ids}
+    unfiled = sorted(set(active) - covered)
+
+    index_slug = _page_slug(f"{project}-index")
+    # Entry set per page, known up front, so cross-links can be computed from
+    # actual overlap instead of "everything else in this project".
+    page_ids = {_page_slug(f"{project}-{t}"): set(tally[t]) for t in clusters}
+    if unfiled:
+        page_ids[_page_slug(f"{project}-unfiled")] = set(unfiled)
+    slugs = sorted(page_ids)
+
+    data = _read_pages(cfg)
+    # A rebuild REPLACES this project's pages: a cluster that no longer exists
+    # must not linger as a page nothing can make stale.
+    data["pages"] = [p for p in data["pages"] if p.get("project") != project]
+
+    built = []
+    for t in clusters:
+        own = _page_slug(f"{project}-{t}")
+        page = _compile_one(cfg, project, context_dir, t,
+                            {"kind": "tag", "value": t},
+                            _related_slugs(own, page_ids[own], page_ids,
+                                           index_slug))
+        _upsert_page(data, page)
+        built.append(page)
+    if unfiled:
+        chosen = {eid: active[eid] for eid in unfiled}
+        own = _page_slug(f"{project}-unfiled")
+        page = _build_page(project, "unfiled",
+                           {"kind": "unfiled", "value": "unfiled", "floor": floor},
+                           chosen, len(active),
+                           _related_slugs(own, page_ids[own], page_ids,
+                                          index_slug),
+                           entries)
+        _upsert_page(data, page)
+        built.append(page)
+
+    index_body = ["# %s — index" % project, "",
+                  "*%d active entries across %d cluster pages.*"
+                  % (len(active), len(clusters)), ""]
+    for t in clusters:
+        index_body.append("- [[%s]] — %d entries" % (_page_slug(f"{project}-{t}"),
+                                                     len(tally[t])))
+    if unfiled:
+        index_body.append("- [[%s]] — %d entries matching no cluster"
+                          % (_page_slug(f"{project}-unfiled"), len(unfiled)))
+    index = {
+        "id": "page-" + index_slug, "project": project,
+        "title": f"{project} — index", "slug": index_slug,
+        "selector": {"kind": "index", "value": ""},
+        # The index summarises pages, not entries, so it has no entry sources
+        # and cannot go stale by source-diffing. It is rebuilt whenever the
+        # project is, which is the only thing that can change it.
+        "sources": [], "candidate_count": len(active),
+        "body": "\n".join(index_body) + "\n",
+        "body_hash": hashlib.sha1(("\n".join(index_body) + "\n").encode()).hexdigest(),
+        "identity": hashlib.sha1(("index" + "|".join(slugs)).encode()).hexdigest(),
+        "compiled_at": _now(),
+    }
+    _upsert_page(data, index)
+    _write_pages(cfg, data)
+    return json.dumps({
+        "status": "compiled",
+        "project": project,
+        "index": index["id"],
+        "pages": [p["id"] for p in built],
+        "clusters": len(clusters),
+        "unfiled_entries": len(unfiled),
+        "active_entries": len(active),
+        "coverage": {"on_a_cluster_page": len(covered), "unfiled": len(unfiled)},
+        "store": cfg["pages_store"],
+    }, indent=2)
+
+
+@mcp.tool()
+def list_pages(project: str = "", stale_only: bool = False) -> str:
+    """List compiled pages with their computed staleness and, when stale, the
+    entry that caused it.
+
+    Staleness is recomputed against the live .context/ store on every call —
+    never cached, never inferred from age. Causes are: `superseded` (a source
+    was replaced), `deprecated`, `changed` (content hash moved, with or without
+    a timestamp bump), `orphaned` (the source entry is gone), and `new_match`
+    (an entry the selector now matches that the page never compiled)."""
+    cfg, err = _require_cfg()
+    if err:
+        return err
+    data = _read_pages(cfg)
+    by_project = {}
+    out = []
+    for page in data["pages"]:
+        proj = page.get("project") or cfg["project"]
+        if project and proj != project:
+            continue
+        if proj not in by_project:
+            try:
+                _, ctx = _pages_context_dir(cfg, proj)
+                by_project[proj] = _read_entries(ctx)
+            except ConfigError:
+                # The project left the map. Report the page as unresolvable
+                # rather than silently clean — a page whose store cannot be
+                # read is precisely the state a stale check must not call green.
+                by_project[proj] = None
+        entries = by_project[proj]
+        if entries is None:
+            out.append(dict(_page_view(page, True, [{
+                "entry_id": "*", "cause": "unresolvable_project",
+                "detail": "no store for project %r; add it to CAMBIUM_PROJECTS"
+                          % proj}])))
+            continue
+        stale, causes = _page_staleness(page, entries)
+        if stale_only and not stale:
+            continue
+        out.append(_page_view(page, stale, causes))
+    return json.dumps({
+        "pages": out,
+        "count": len(out),
+        "stale_count": sum(1 for p in out if p["stale"]),
+        "store": cfg["pages_store"],
+        "note": "Pages are build artifacts: delete the store and recompile to "
+                "rebuild them. They are never returned by recall().",
+    }, indent=2)
+
+
+@mcp.tool()
+def recompile(page_id: str = "", all_stale: bool = False) -> str:
+    """Rebuild a page (or every stale page) from the current entries.
+
+    Recompiling an unchanged store is a no-op in substance: the page's
+    `identity` — its body plus its source fingerprints — is unchanged, and only
+    `compiled_at` moves. The response reports `changed` per page so a caller can
+    tell a real rebuild from a refresh."""
+    cfg, err = _require_cfg()
+    if err:
+        return err
+    if not page_id and not all_stale:
+        return json.dumps(
+            {"error": "pass page_id, or all_stale=True"}, indent=2)
+    data = _read_pages(cfg)
+    targets, results = [], []
+    ctx_cache = {}
+
+    def ctx_for(proj):
+        if proj not in ctx_cache:
+            try:
+                ctx_cache[proj] = _pages_context_dir(cfg, proj)[1]
+            except ConfigError:
+                ctx_cache[proj] = None
+        return ctx_cache[proj]
+
+    for page in data["pages"]:
+        proj = page.get("project") or cfg["project"]
+        if page_id and page.get("id") != page_id:
+            continue
+        if all_stale and not page_id:
+            ctx = ctx_for(proj)
+            if ctx is None:
+                continue
+            stale, _ = _page_staleness(page, _read_entries(ctx))
+            if not stale:
+                continue
+        targets.append(page)
+
+    if page_id and not targets:
+        return json.dumps({"error": f"no page with id {page_id!r}"}, indent=2)
+
+    for page in targets:
+        proj = page.get("project") or cfg["project"]
+        ctx = ctx_for(proj)
+        if ctx is None:
+            results.append({"id": page["id"], "status": "skipped",
+                            "reason": "project %r is not resolvable" % proj})
+            continue
+        if page["selector"].get("kind") == "index":
+            results.append({"id": page["id"], "status": "skipped",
+                            "reason": "index pages rebuild via compile_project"})
+            continue
+        others = {p["slug"]: {s["entry_id"] for s in p.get("sources", [])}
+                  for p in data["pages"]
+                  if p.get("project") == proj and p.get("slug")}
+        idx = _page_slug(f"{proj}-index")
+        siblings = _related_slugs(
+            page.get("slug"), {s["entry_id"] for s in page.get("sources", [])},
+            others, idx if idx in others else None)
+        if page["selector"].get("kind") == "unfiled":
+            entries = _read_entries(ctx)
+            active = {eid: rec for eid, rec in entries.items()
+                      if _entry_is_active(rec)}
+            chosen = {eid: active[eid] for eid in
+                      sorted(_unfiled_ids(entries, page["selector"].get("floor")))}
+            fresh = _build_page(proj, page["title"], page["selector"], chosen,
+                                len(active), siblings, entries)
+        else:
+            fresh = _compile_one(cfg, proj, ctx, page["title"],
+                                 page["selector"], siblings)
+        changed = fresh["identity"] != page.get("identity")
+        _upsert_page(data, fresh)
+        results.append({"id": fresh["id"], "status": "recompiled",
+                        "changed": changed,
+                        "sources": len(fresh["sources"])})
+    _write_pages(cfg, data)
+    return json.dumps({
+        "status": "ok",
+        "recompiled": sum(1 for r in results if r["status"] == "recompiled"),
+        "changed": sum(1 for r in results if r.get("changed")),
+        "results": results,
+    }, indent=2)
+
+
+@mcp.tool()
+def export_pages(out_dir: str = "", project: str = "") -> str:
+    """Write every compiled page to disk as a markdown file — a readable wiki.
+
+    One file per page, named `<slug>.md`, which is exactly what the `[[slug]]`
+    links in the bodies already point at. That is Obsidian's link format, so
+    opening the output directory as a vault gives working navigation and
+    backlinks with no further setup.
+
+    The directory is REGENERATED, not merged: files from a previous export whose
+    pages no longer exist are removed, because a page tier that leaves orphans
+    behind stops being a build artifact. Only files carrying this tool's own
+    marker are ever deleted — anything else in the directory is left alone."""
+    cfg, err = _require_cfg()
+    if err:
+        return err
+    out_dir = _abspath(out_dir) if out_dir else os.path.join(
+        cfg["repo"], LOCAL_DIR, "pages")
+    data = _read_pages(cfg)
+    pages = [p for p in data["pages"]
+             if not project or p.get("project") == project]
+    if not pages:
+        return json.dumps({
+            "error": "no compiled pages" + (f" for project {project!r}" if project
+                                            else ""),
+            "fix": "run compile_project first",
+        }, indent=2)
+
+    os.makedirs(out_dir, exist_ok=True)
+    entries_cache = {}
+    written, wanted = [], set()
+    for page in sorted(pages, key=lambda p: p["id"]):
+        proj = page.get("project") or cfg["project"]
+        if proj not in entries_cache:
+            try:
+                entries_cache[proj] = _read_entries(_pages_context_dir(cfg, proj)[1])
+            except ConfigError:
+                entries_cache[proj] = {}
+        stale, causes = _page_staleness(page, entries_cache[proj])
+        name = f"{page.get('slug') or page['id']}.md"
+        wanted.add(name)
+        # Frontmatter is Obsidian Properties: it makes the vault queryable
+        # (Dataview/Bases) without the page body having to carry the metadata.
+        # No compiled_at — an unchanged store must export byte-identically.
+        head = [
+            "---",
+            f"project: {proj}",
+            f"page_id: {page['id']}",
+            f"selector: {page['selector'].get('kind')}"
+            + (f" / {page['selector']['value']}" if page["selector"].get("value") else ""),
+            f"sources: {len(page.get('sources', []))}",
+            f"stale: {'true' if stale else 'false'}",
+            f"generated_by: {PAGES_MARKER}",
+            "---",
+            "",
+        ]
+        if stale:
+            head += ["> [!warning] This page is stale",
+                     "> " + "; ".join(f"`{c['entry_id']}` {c['cause']}"
+                                      for c in causes[:6]), ""]
+        with open(os.path.join(out_dir, name), "w", encoding="utf-8",
+                  newline="\n") as f:
+            f.write("\n".join(head) + page["body"])
+        written.append(name)
+
+    # The concept tier as one readable page, GENERATED. It was hand-maintained
+    # for exactly one session before becoming a second copy of facts the
+    # knowledge store already owned — which is this corpus's own rule about not
+    # stating a fact in two places, and about prose drifting silently because
+    # nothing executes it. The store is the authority; this is a projection.
+    laws = _lessons_block(cfg, True, _mesh_index(cfg))
+    if laws["laws"]:
+        name = "_LESSONS.md"
+        wanted.add(name)
+        out = ["---", "title: What we've learned", f"laws: {laws['count']}",
+               f"behind: {laws['needs_update']}",
+               f"generated_by: {PAGES_MARKER}", "---", "",
+               "# What we've learned", "",
+               f"*{laws['count']} cross-project laws, drawn from the whole mesh. "
+               "Generated from cambium's knowledge store — edit the laws there, "
+               "not this file.*", ""]
+        for law in laws["laws"]:
+            out += [f"## {law['law']}", ""]
+            if law.get("evidence"):
+                out += [law["evidence"], ""]
+            bits = []
+            if law["evidence_projects"]:
+                bits.append("Seen in: " + ", ".join(law["evidence_projects"]))
+            if law["cites"]:
+                bits.append("Cites: " + ", ".join(f"`{c}`" for c in law["cites"]))
+            if bits:
+                out += ["*" + " · ".join(bits) + "*", ""]
+            if law["unincorporated"]:
+                out += ["> [!note] Candidate evidence not yet cited: "
+                        + ", ".join(f"`{e}`" for e in law["unincorporated"][:12]),
+                        ""]
+        with open(os.path.join(out_dir, name), "w", encoding="utf-8",
+                  newline="\n") as f:
+            f.write("\n".join(out))
+        written.append(name)
+
+    # Reap only our own leftovers, identified by the marker in the frontmatter.
+    removed = []
+    for existing in sorted(os.listdir(out_dir)):
+        if not existing.endswith(".md") or existing in wanted:
+            continue
+        path = os.path.join(out_dir, existing)
+        try:
+            with open(path, encoding="utf-8") as f:
+                if PAGES_MARKER not in f.read(400):
+                    continue          # not ours — leave it alone
+            os.remove(path)
+            removed.append(existing)
+        except OSError:
+            continue
+    return json.dumps({
+        "status": "exported",
+        "out_dir": out_dir,
+        "written": len(written),
+        "removed_orphans": removed,
+        "stale_pages": sum(1 for p in pages
+                           if _page_staleness(
+                               p, entries_cache.get(p.get("project")
+                                                    or cfg["project"], {}))[0]),
+        "note": "Open this directory as an Obsidian vault — the [[links]] in "
+                "the page bodies resolve to these filenames.",
+    }, indent=2)
+
+
+# --------------------------------------------------------------------------- #
+# snapshot export — one JSON file describing the whole mesh, for a static
+# dashboard to render with no server and no live store access.
+#
+# Two rules shape what goes in it:
+#
+#   1. No bodies by default. Entry text (summary/rule/name, and the `summary`
+#      verify_quality echoes into every flagged item) is omitted unless the
+#      caller asks for it. Counts, statuses, ids and edges are enough to render
+#      the whole dashboard; the prose is opt-in.
+#   2. Nothing that was not checked may render as checked. verify_quality lives
+#      in context-keeper, so cambium shells out to it. When that call cannot be
+#      made the snapshot says checked=false with the reason — it never emits an
+#      empty gap list, which a dashboard would draw as a clean bill of health.
+#      (Same lesson as distill's "a skipped step must not look like a completed
+#      one" and context-keeper's own drift_checked flag.)
+#
+# Like context-keeper's export_snapshot, the payload carries NO generated-at
+# timestamp: an unchanged mesh exports byte-identically, so committing it does
+# not churn git and a diff means something actually moved.
+# --------------------------------------------------------------------------- #
+SNAPSHOT_SCHEMA = 1
+
+
+def _ck_runner():
+    """How to invoke context-keeper's CLI, or None. Prefers an explicit path
+    (CAMBIUM_CONTEXT_KEEPER — either the console script or server.py) and falls
+    back to the console script on PATH."""
+    from shutil import which
+    explicit = os.environ.get("CAMBIUM_CONTEXT_KEEPER", "").strip()
+    if explicit:
+        p = _abspath(explicit)
+        if os.path.isfile(p):
+            return [sys.executable, p] if p.endswith(".py") else [p]
+        return None
+    found = which("context-keeper")
+    return [found] if found else None
+
+
+def _quality_gaps(project_dir, include_bodies):
+    """context-keeper's verify_quality for one project, via its CLI.
+
+    A subprocess rather than an import: cambium's whole integration model is to
+    read substrates in place and never couple to the other tool's code, and
+    importing context-keeper's server would pull its mirror/urllib/usage stack
+    into this process for one call."""
+    runner = _ck_runner()
+    if not runner:
+        return {"checked": False,
+                "reason": "context-keeper CLI not found; set "
+                          "CAMBIUM_CONTEXT_KEEPER to its server.py or install "
+                          "the console script",
+                "gaps": None}
+    try:
+        p = subprocess.run(
+            runner + ["verify_quality", json.dumps({"project_dir": project_dir})],
+            capture_output=True, text=True, timeout=GIT_TIMEOUT,
+            env=_noninteractive_env())
+        data = json.loads(p.stdout or "{}")
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        return {"checked": False, "reason": f"verify_quality failed: {e}",
+                "gaps": None}
+    if not isinstance(data, dict) or "flagged" in data and not isinstance(
+            data.get("flagged"), list):
+        return {"checked": False, "reason": "unparseable verify_quality output",
+                "gaps": None}
+    if data.get("error"):
+        return {"checked": False, "reason": str(data["error"]), "gaps": None}
+    gaps = []
+    for f in data.get("flagged", []):
+        # An issue is {"type": "isolated", "detail": "..."} — the LABEL is
+        # `type`, and `detail` can quote the entry (the mojibake check echoes
+        # the damaged text), so detail travels only when bodies are allowed.
+        issues = []
+        for i in f.get("issues", []):
+            if isinstance(i, dict):
+                issues.append({"type": i.get("type") or "?",
+                               **({"detail": _demojibake(i.get("detail") or "")}
+                                  if include_bodies else {})})
+            else:
+                issues.append({"type": str(i)})
+        row = {"id": f.get("id"), "type": f.get("type"), "issues": issues}
+        if include_bodies:
+            row["summary"] = _demojibake(f.get("summary") or "")
+        gaps.append(row)
+    return {
+        "checked": True,
+        "gaps": gaps,
+        "count": len(gaps),
+        "total_active": data.get("total_active"),
+        # Carried through verbatim: "we could not look" is not "nothing drifted".
+        "drift_checked": data.get("drift_checked"),
+    }
+
+
+LAW_TAG = "xylem-law"      # marks a cross-project concept page in the knowledge store
+
+
+def _cited_ids(text):
+    return set(re.findall(r"\b((?:dec|con|pipe)-[0-9a-z]+(?:-[0-9a-z]+)?)\b",
+                          (text or "").lower()))
+
+
+def _mesh_index(cfg):
+    """{entry_id: (project, type, entry)} for every active entry in every named
+    project. The concept tier is checked against the WHOLE corpus — a law that
+    only knew about one project would not be a cross-project law."""
+    targets = {cfg["project"]: cfg["context_dir"]}
+    for name, path in cfg["projects"].items():
+        targets[name] = os.path.join(path, ".context")
+    mesh = {}
+    for name, ctx in targets.items():
+        if not os.path.isdir(ctx):
+            continue
+        for eid, rec in _read_entries(ctx).items():
+            if (rec[2].get("status") or "active") == "active":
+                mesh[eid] = (name, rec[0], rec[2])
+    return mesh
+
+
+def _lessons_block(cfg, include_bodies, mesh):
+    """The concept tier: cross-project laws, each with its evidence and — the
+    part that makes it self-iterating — the entries that MATCH it but are not
+    yet cited in it.
+
+    This is the LLM-wiki compile trigger expressed deterministically. A concept
+    page is written by an agent (judgement: "these six entries are one idea"),
+    but whether it has fallen behind the corpus is a comparison anyone can run:
+    take the law's topic tags, find every entry in the mesh carrying them, and
+    subtract the ids the law already cites. What is left is unincorporated
+    evidence, and it is the work list for the next compile — nobody has to
+    notice or ask.
+
+    `mesh` is {entry_id: (project, type, entry)} across every named project."""
+    scopes = [("local", _read_local(cfg)["items"])]
+    try:
+        scopes.append(("team", _read_team(cfg)))
+    except Exception:
+        pass
+    try:
+        if cfg["org_repo"]:
+            scopes.append(("org", _read_org(cfg)))
+    except Exception:
+        pass
+
+    rows = []
+    for scope, items in scopes:
+        for item in items:
+            tags = {str(t).lower() for t in (item.get("tags") or [])}
+            if LAW_TAG not in tags or item.get("status") != "active":
+                continue
+            cited = _cited_ids(item.get("content", "") + " " + item.get("why", ""))
+            topic = tags - {LAW_TAG, "cross-project"}
+            # Score by how many of the law's topics an entry carries. A single
+            # shared tag is weak — broad tags like `testing` or `architecture`
+            # match most of the corpus — so one hit is a lead and two is a
+            # candidate. Without this the work list fired on everything, which
+            # by this store's own rule is not a signal at all.
+            scored, projects = {}, set()
+            for eid, (proj, _t, e) in mesh.items():
+                etags = {str(x).lower() for x in (e.get("tags") or [])}
+                overlap = topic & etags
+                if overlap:
+                    scored[eid] = len(overlap)
+                    projects.add(proj)
+            leads = sorted(set(scored) - cited,
+                           key=lambda e: (-scored[e], e))
+            unincorporated = [e for e in leads if scored[e] >= 2]
+            weak = [e for e in leads if scored[e] < 2]
+            row = {
+                "id": item.get("id"),
+                "scope": scope,
+                "law": _demojibake(item.get("content", "")),
+                "topics": sorted(topic),
+                "cites": sorted(cited),
+                "evidence_projects": sorted(projects),
+                # The work list: entries sharing TWO OR MORE of the law's
+                # topics that it does not cite. Non-empty means the corpus has
+                # moved past the page and it is due a recompile.
+                "unincorporated": unincorporated[:40],
+                "unincorporated_count": len(unincorporated),
+                # Single-tag matches, counted but not listed. Reported so the
+                # narrowing is visible rather than looking like there was
+                # nothing else there.
+                "weak_leads": len(weak),
+                "recalls": (item.get("trust") or {}).get("recalls", 0),
+            }
+            if include_bodies:
+                row["evidence"] = _demojibake(item.get("why", ""))
+            rows.append(row)
+    rows.sort(key=lambda r: (-r["unincorporated_count"], r["id"] or ""))
+    return {
+        "count": len(rows),
+        "laws": rows,
+        "needs_update": sum(1 for r in rows if r["unincorporated_count"]),
+        "note": "A law is written by judgement; whether it has fallen behind "
+                "the corpus is computed. `unincorporated` is the next compile's "
+                "work list.",
+    }
+
+
+def _survey_script():
+    """context-keeper's supersession survey, or None. Derived from
+    CAMBIUM_CONTEXT_KEEPER (the script is `scripts/` beside `server.py`) so one
+    setting wires both it and verify_quality; overridable outright."""
+    explicit = os.environ.get("CAMBIUM_SUPERSESSION_SURVEY", "").strip()
+    if explicit:
+        p = _abspath(explicit)
+        return p if os.path.isfile(p) else None
+    ck = os.environ.get("CAMBIUM_CONTEXT_KEEPER", "").strip()
+    if not ck:
+        return None
+    root = os.path.dirname(_abspath(ck))
+    guess = os.path.join(root, "scripts", "survey_supersessions.py")
+    return guess if os.path.isfile(guess) else None
+
+
+def _link_proposals(cfg):
+    """Missing supersession links, proposed automatically for every named
+    project — so the backfill is something you LOOK AT rather than something you
+    remember to run.
+
+    Delegates to context-keeper's survey script rather than reimplementing its
+    heuristic, for the same reason verify_quality is shelled out to: it scores
+    pairs with the very function the write-time advisory uses, so a backfilled
+    link matches what the advisory would have suggested at the time. A second
+    implementation here would drift from that and the two would disagree about
+    what "same subject" means.
+
+    NOTHING IS EVER WRITTEN TO A STORE. The script is read-only by design, and
+    that restraint is deliberate upstream: "these two entries look related" is
+    not the same claim as "this one replaced that one", and only the second
+    justifies an edge. An edge written from a heuristic silently demotes a rule
+    that may still be in force. So this surfaces proposals where you already
+    look, and you decide."""
+    script = _survey_script()
+    if not script:
+        return {"checked": False, "proposals": None,
+                "reason": "context-keeper's survey_supersessions.py not found; "
+                          "set CAMBIUM_CONTEXT_KEEPER (or "
+                          "CAMBIUM_SUPERSESSION_SURVEY)"}
+    roots = {os.path.dirname(p) for p in cfg["projects"].values()}
+    roots.add(os.path.dirname(cfg["repo"]))
+    # The script writes its payload to --out and only a summary to stdout, so
+    # the JSON is collected from a temp file rather than off the wire.
+    fd, tmp = tempfile.mkstemp(prefix="cambium-survey-", suffix=".json")
+    os.close(fd)
+    argv = [sys.executable, script, "--json", "--out", tmp]
+    for r in sorted(roots):
+        argv += ["--root", r]
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True,
+                           timeout=max(GIT_TIMEOUT, 60),
+                           env=_noninteractive_env())
+        if p.returncode != 0:
+            return {"checked": False, "proposals": None,
+                    "reason": (p.stderr or "survey exited %d" % p.returncode).strip()[:300]}
+        with open(tmp, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        return {"checked": False, "proposals": None,
+                "reason": f"survey output unreadable: {e}"}
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    # The script discovers stores by scanning a root, so it reads more than the
+    # named projects. Filtering here means only named projects are ever
+    # SURFACED, keeping the explicit-map promise at the output boundary.
+    named = set(cfg["projects"]) | {cfg["project"]}
+    out = {}
+    for prop in data.get("proposals", []):
+        if prop.get("project") in named:
+            out.setdefault(prop["project"], []).append(prop)
+    unpaired = {}
+    for u in data.get("unpaired_markers", []):
+        if u.get("project") in named:
+            unpaired.setdefault(u["project"], []).append(u)
+    return {"checked": True, "proposals": out, "unpaired": unpaired,
+            "threshold": data.get("threshold")}
+
+
+def _project_snapshot(cfg, name, context_dir, pages, include_bodies,
+                      links=None):
+    entries = _read_entries(context_dir)
+    by_kind, by_status, by_kind_status, nodes, edges = {}, {}, {}, [], []
+    for eid, rec in sorted(entries.items()):
+        tname, _title_f, e = rec
+        status = e.get("status") or "active"
+        by_kind[tname] = by_kind.get(tname, 0) + 1
+        by_status[status] = by_status.get(status, 0) + 1
+        by_kind_status.setdefault(tname, {})
+        by_kind_status[tname][status] = by_kind_status[tname].get(status, 0) + 1
+        node = {"id": eid, "kind": tname, "status": status,
+                "updated_at": e.get("updated_at") or e.get("created_at") or ""}
+        if include_bodies:
+            node["title"] = _entry_title(rec)
+        nodes.append(node)
+        target = e.get("superseded_by")
+        if target:
+            # A dangling edge is real and must be drawn as such: record_entry
+            # skips unknown supersedes ids silently, and prune_stale can remove
+            # a target, so "superseded by something that isn't there" is a state
+            # the store reaches on its own.
+            edges.append({"from": eid, "to": target, "kind": tname,
+                          "dangling": target not in entries})
+
+    page_rows = []
+    for page in pages:
+        stale, causes = _page_staleness(page, entries)
+        row = _page_view(page, stale, causes)
+        if not include_bodies:
+            row.pop("title", None)
+        page_rows.append(row)
+
+    return {
+        "name": name,
+        "counts": {"total": len(entries), "by_kind": by_kind,
+                   "by_status": by_status, "by_kind_status": by_kind_status},
+        "entries": nodes,
+        "supersession_edges": edges,
+        "pages": page_rows,
+        "stale_page_count": sum(1 for p in page_rows if p["stale"]),
+        "quality": _quality_gaps(os.path.dirname(context_dir), include_bodies),
+        "links": _project_links(links, name, include_bodies),
+    }
+
+
+def _project_links(links, name, include_bodies):
+    """One project's slice of the survey. Same honesty rule as quality: a survey
+    that could not run reports `checked: false`, never an empty proposal list,
+    which a dashboard would draw as "nothing to link"."""
+    if not links or not links.get("checked"):
+        return {"checked": False, "proposals": None,
+                "reason": (links or {}).get("reason", "not run")}
+    rows = []
+    for prop in links.get("proposals", {}).get(name, []):
+        ev = prop.get("evidence", {})
+        row = {
+            "older_id": prop.get("older_id"),
+            "newer_id": prop.get("newer_id"),
+            "kind": prop.get("kind"),
+            "both_signals": bool(prop.get("both_signals")),
+            "overlap_score": ev.get("overlap_score"),
+            "shared_tags": ev.get("shared_tags") or [],
+            "strong_markers": ev.get("strong_markers") or [],
+        }
+        if include_bodies:
+            row["older_summary"] = _demojibake(prop.get("older_summary") or "")
+            row["newer_summary"] = _demojibake(prop.get("newer_summary") or "")
+        rows.append(row)
+    # Strongest first: a pair where the newer entry's own text says something
+    # changed AND there is a sibling about the same subject to have changed from.
+    rows.sort(key=lambda r: (not r["both_signals"], -(r["overlap_score"] or 0),
+                             r["older_id"] or ""))
+    return {
+        "checked": True,
+        "proposals": rows,
+        "count": len(rows),
+        "both_signals": sum(1 for r in rows if r["both_signals"]),
+        "unpaired_markers": len(links.get("unpaired", {}).get(name, [])),
+        "note": "Proposals only. Nothing was written to any store — an edge "
+                "written from a heuristic silently demotes a rule that may "
+                "still be in force.",
+    }
+
+
+def _build_snapshot(cfg, include_bodies=False):
+    """The whole mesh as one JSON-able dict. Reads only the projects named in
+    CAMBIUM_PROJECTS plus the configured repo — never a filesystem scan, so a
+    store can only be in here because someone named it."""
+    targets = {cfg["project"]: cfg["context_dir"]}
+    for name, path in cfg["projects"].items():
+        targets[name] = os.path.join(path, ".context")
+    pages_by_project = {}
+    for page in _read_pages(cfg)["pages"]:
+        pages_by_project.setdefault(page.get("project") or cfg["project"],
+                                    []).append(page)
+
+    # One survey for the whole mesh, not one per project: the script scans by
+    # root, so running it per project would rescan everything N times.
+    links = _link_proposals(cfg)
+
+    mesh = _mesh_index(cfg)
+
+    projects, skipped = [], []
+    for name in sorted(targets):
+        ctx = targets[name]
+        if not os.path.isdir(ctx):
+            skipped.append({"name": name, "reason": "no .context/ store at %s" % ctx})
+            continue
+        projects.append(_project_snapshot(cfg, name, ctx,
+                                          pages_by_project.get(name, []),
+                                          include_bodies, links))
+    lessons = _lessons_block(cfg, include_bodies, mesh)
+    return {
+        "schema": SNAPSHOT_SCHEMA,
+        "generator": "cambium",
+        "includes_bodies": include_bodies,
+        "lessons": lessons,
+        "projects": projects,
+        # Named and reported, so a project silently missing from the dashboard
+        # is visible as a skip rather than as an absence.
+        "skipped_projects": skipped,
+        "totals": {
+            "projects": len(projects),
+            "entries": sum(p["counts"]["total"] for p in projects),
+            "pages": sum(len(p["pages"]) for p in projects),
+            "stale_pages": sum(p["stale_page_count"] for p in projects),
+            "quality_gaps": sum(p["quality"].get("count") or 0 for p in projects),
+            "projects_without_quality_check": sum(
+                1 for p in projects if not p["quality"]["checked"]),
+            "laws": lessons["count"],
+            "laws_behind": lessons["needs_update"],
+            "link_proposals": sum(p["links"].get("count") or 0 for p in projects),
+            "link_proposals_strong": sum(
+                p["links"].get("both_signals") or 0 for p in projects),
+            "projects_without_link_survey": sum(
+                1 for p in projects if not p["links"]["checked"]),
+        },
+    }
+
+
+@mcp.tool()
+def refresh(out: str = "", vault: str = "", include_bodies: bool = True) -> str:
+    """Bring every derived surface up to date in one call: recompile each named
+    project's pages, rewrite the markdown vault, and re-export the snapshot.
+
+    This exists to be wired to a hook. The whole point of the page and concept
+    tiers is that they stay current without anyone remembering to run anything —
+    a synthesis you have to ask for is one you will find stale at exactly the
+    moment you needed it. distill() already runs from SessionEnd for the same
+    reason; this belongs on the same path.
+
+    Everything it does is idempotent, so firing it unconditionally is safe: an
+    unchanged store recompiles to identical pages and exports a byte-identical
+    snapshot."""
+    cfg, err = _require_cfg()
+    if err:
+        return err
+    projects = sorted(set(list(cfg["projects"]) + [cfg["project"]]))
+    compiled, failed = [], []
+    for name in projects:
+        try:
+            _, ctx = _pages_context_dir(cfg, name)
+        except ConfigError as e:
+            failed.append({"project": name, "reason": str(e)})
+            continue
+        if not os.path.isdir(ctx):
+            failed.append({"project": name, "reason": "no .context/ store"})
+            continue
+        r = json.loads(compile_project(project=name))
+        if r.get("error"):
+            failed.append({"project": name, "reason": r["error"]})
+        else:
+            compiled.append({"project": name, "pages": len(r["pages"]) + 1,
+                             "unfiled": r["unfiled_entries"]})
+    vault_out = None
+    if vault:
+        v = json.loads(export_pages(out_dir=vault))
+        vault_out = None if v.get("error") else {
+            "dir": v["out_dir"], "written": v["written"],
+            "reaped": len(v["removed_orphans"])}
+    snap = json.loads(export_snapshot(out=out, include_bodies=include_bodies))
+    # Read the law counts from the snapshot that was just written. An earlier
+    # version recomputed them against an EMPTY mesh to save a pass and reported
+    # laws_behind: 0 — a check that could only ever return clean, which is the
+    # exact failure this codebase keeps writing rules about.
+    totals = snap.get("totals") or {}
+    return json.dumps({
+        "status": "refreshed",
+        "projects_compiled": len(compiled),
+        "compiled": compiled,
+        "failed": failed,
+        "vault": vault_out,
+        "snapshot": {"path": snap.get("path"), "totals": totals},
+        # Surfaced here so a hook's output alone tells you whether the concept
+        # tier has fallen behind, without opening the dashboard.
+        "laws": totals.get("laws"),
+        "laws_behind": totals.get("laws_behind"),
+    }, indent=2)
+
+
+@mcp.tool()
+def export_snapshot(out: str = "", include_bodies: bool = False) -> str:
+    """Write the whole mesh to one JSON file for a static dashboard to read.
+
+    Contains, per project: entry counts by kind and status, every entry as a
+    graph node, supersession edges (including dangling ones), compiled pages
+    with their computed staleness and cause, and context-keeper's verify_quality
+    gaps. Entry prose is EXCLUDED unless include_bodies is set.
+
+    The payload carries no generated-at timestamp, so re-exporting an unchanged
+    mesh produces a byte-identical file and committing it never churns git."""
+    cfg, err = _require_cfg()
+    if err:
+        return err
+    snap = _build_snapshot(cfg, include_bodies)
+    path = _abspath(out) if out else os.path.join(
+        cfg["repo"], LOCAL_DIR, "snapshot.json")
+    _atomic_write_json(path, snap)
+    return json.dumps({
+        "status": "exported",
+        "path": path,
+        "includes_bodies": include_bodies,
+        "totals": snap["totals"],
+        "skipped_projects": snap["skipped_projects"],
+    }, indent=2)
+
+
+# --------------------------------------------------------------------------- #
 # setup — the one tool that works BEFORE cambium is configured. It validates,
 # scaffolds .cambium/, and writes the fallback config the server reads when env
 # vars are absent (env still wins). It never runs org-repo creation unprompted.
@@ -2822,8 +4536,77 @@ def session_primer(limit: int = 8) -> str:
     return json.dumps(digest, indent=2)
 
 
+def _run_cli(argv):
+    """CLI parity for the commands that make sense outside an MCP session.
+
+    Mirrors context-keeper's CLI shape deliberately (`<command> [flags]`,
+    dispatching to the SAME function the MCP tool calls — no duplicated logic)
+    so one habit works across the suite. Exit codes: 2 usage error, 1 if the
+    command reported an error, 0 otherwise."""
+    commands = {
+        "export-snapshot": (
+            "write the mesh snapshot a dashboard reads "
+            "[--out PATH] [--bodies]"),
+        "export-pages": (
+            "write compiled pages as markdown (an Obsidian vault) "
+            "[--out DIR] [--project NAME]"),
+        "refresh": (
+            "recompile pages + vault + snapshot in one call; wire this to a "
+            "hook [--out PATH] [--vault DIR]"),
+    }
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        sys.stderr.write(
+            "Usage: cambium-mcp <command> [flags]   (no args = stdio MCP server)\n"
+            + "".join(f"  {n:<18}{d}\n" for n, d in sorted(commands.items())))
+        return 0 if argv else 2
+
+    name = argv[0]
+    if name not in commands:
+        sys.stderr.write(f"Unknown command: {name}\n"
+                         "Run 'cambium-mcp --help' for the list.\n")
+        return 2
+
+    rest, out, bodies, project, vault = argv[1:], "", False, "", ""
+    i = 0
+    while i < len(rest):
+        if rest[i] == "--bodies":
+            bodies = True
+        elif rest[i] == "--out" and i + 1 < len(rest):
+            out = rest[i + 1]
+            i += 1
+        elif rest[i] == "--project" and i + 1 < len(rest):
+            project = rest[i + 1]
+            i += 1
+        elif rest[i] == "--vault" and i + 1 < len(rest):
+            vault = rest[i + 1]
+            i += 1
+        else:
+            sys.stderr.write(f"Unknown or incomplete flag: {rest[i]}\n")
+            return 2
+        i += 1
+
+    if name == "export-pages":
+        result = export_pages(out_dir=out, project=project)
+    elif name == "refresh":
+        result = refresh(out=out, vault=vault)
+    else:
+        result = export_snapshot(out=out, include_bodies=bodies)
+    sys.stdout.write(result + "\n")
+    try:
+        return 1 if json.loads(result).get("error") else 0
+    except (ValueError, AttributeError):
+        return 0
+
+
 def main():
-    """Console entry point (pip install cambium-mcp -> `cambium-mcp`)."""
+    """Console entry point (pip install cambium-mcp -> `cambium-mcp`).
+
+    Args present = CLI; no args = the stdio MCP server, unchanged. Same
+    convention as context-keeper's entry point, so adding a command can never
+    change what an MCP client launching the bare executable gets."""
+    argv = sys.argv[1:]
+    if argv:
+        sys.exit(_run_cli(argv))
     mcp.run()
 
 

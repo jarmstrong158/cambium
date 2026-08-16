@@ -434,5 +434,187 @@
     "updated_at": "2026-08-06T02:21:41.234510+00:00",
     "verified_at": "2026-08-06T02:21:41.188453+00:00",
     "verified_sha": "863421be22bcd55d6853e0ef0fac623a2ba2d773"
+  },
+  {
+    "id": "dec-014-f951",
+    "summary": "Pages are a build-artifact tier stored in .cambium/pages.json, isolated from every trust-tier read by file separation, with staleness computed from a per-source content hash rather than timestamps.",
+    "problem": "cambium needed a synthesis layer that compiles readable pages from context-keeper entries, but a derived summary that could be recalled, promoted or cited would let a lossy restatement outrank the entries it came from and climb to org scope. Separately, \"is this page still true\" had no honest answer: entries carry created_at/updated_at/verified_at/status but no revision counter, so there was nothing to compare a compile against.",
+    "why_chosen": "Isolation is structural instead of a rule anyone has to remember: every trust-tier read (recall, session_primer, export_markdown, stale_report, review_promotions) iterates data[\"items\"] in knowledge.json, so putting pages in a different file makes them unreachable by construction, and cambium's existing refusal to write .context/ keeps them out of reload_constraints for free. Deleting pages.json loses nothing because every page rebuilds from .context/ alone. For staleness, the content hash is authoritative and updated_at only corroborates, because timestamp error is real in BOTH directions in these stores: they are documented as human-editable JSON and are edited by hand, so a body changes with no bump, while _backfill_updated_at stamps updated_at onto entries that never changed. A fifth cause, new_match, exists because a tag page is most often wrong by omission and no per-source diff can see a newly recorded entry that belongs on the page. compiled_at sits outside the identity hash so an unchanged store recompiles byte-identically, the same choice context-keeper made in export_snapshot for the same git-churn reason.",
+    "what_we_tried": "The first implementation re-ran the selector for every page kind, so index and unfiled pages fell through _select_entries' \"no tag, no topic, so match everything\" branch and reported every active entry as a new match. Seven pages came out stale the instant they were compiled, and only the real stores showed it - the seeded test store was too small. Fixed with _selector_matches returning None for selectors that are not a function of entries, plus a regression test. The unfiled selector also had to record the cluster floor it was built with, since min_cluster=3 yields a different uncovered set than the default and would otherwise report drift that never happened.",
+    "tradeoffs": "Pages read all three entry kinds including pipelines, so the page tier is deliberately a superset of what distill imports as knowledge - one more place the two can diverge. Hashing all non-excluded fields means a future schema field makes every page stale, chosen as the safe failure direction but it will cause a one-off mass recompile.",
+    "alternatives": [],
+    "constraints_created": [
+      "Pages must never be written into .context/ or knowledge.json"
+    ],
+    "related_to": [],
+    "tags": [
+      "cambium",
+      "pages",
+      "synthesis",
+      "staleness",
+      "trust-tier",
+      "build-artifact"
+    ],
+    "retrieval_hints": [
+      "why are pages not recallable",
+      "how does cambium know a page is stale",
+      "content hash instead of updated_at",
+      "index and unfiled pages stale on arrival",
+      "pages.json vs knowledge.json"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-08-16T16:36:57.480466+00:00",
+    "updated_at": "2026-08-16T16:36:57.480466+00:00",
+    "verified_at": "2026-08-16T16:36:57.480466+00:00",
+    "verified_sha": "603d6be33d2ba54214c47c9337c41a55203dc764"
+  },
+  {
+    "id": "dec-015-71d6",
+    "summary": "The mesh dashboard is served from the operator's own machine over Tailscale, not GitHub Pages, and both snapshot.json and pages.json are gitignored. Projects come from an explicit CAMBIUM_PROJECTS map, never a filesystem scan.",
+    "problem": "The dashboard needs the full cross-project mesh to be useful, but that data spans 20 stores on this machine including a private repo and one with no remote. The original plan was to commit the snapshot and deploy the site to GitHub Pages, which collides head-on with con-015-12da in context-keeper and with the reasoning behind gitignoring dashboard.html here.",
+    "why_chosen": "Making the repo private does not solve it: a GitHub Pages site built from a private repo is still a publicly reachable website, since access-controlled Pages is a GitHub Enterprise Cloud feature. So the choice was between a hosted surface with auth in front of it and serving from the machine that already holds the data. Tailscale wins because the data never leaves the desktop at all, which means no new exposure surface to reason about and no amendment to con-015-12da - the constraint is honoured in both its letter and its stated reason rather than worked around. tailscale serve also issues a real HTTPS certificate on the tailnet, which is exactly what a service worker and Add to Home Screen require, so the privacy-preserving option is also the one that makes it installable as a phone app. The cost is that the desktop must be awake to serve, accepted knowingly. The explicit project map follows the same principle at the read end: a filesystem scan silently pulls in private and local-only stores, whereas a name someone typed cannot surprise them, and projects named but missing a store are reported as skipped rather than being silently absent.",
+    "what_we_tried": "GitHub Pages from a private repo was the original request and was rejected once the public-site behaviour was confirmed. A Cloudflare Worker behind Cloudflare Access was the other serious option and fits the existing Worker variants in this suite, but it puts the entire cross-project memory at rest in Cloudflare, which is a real exposure change for a personal tool whose whole point is that the data is private.",
+    "tradeoffs": "No access when the desktop is off or off the tailnet, and no public demo of the dashboard. The snapshot cannot be committed to either public repo, so cross-machine sync needs a private repo (jarmstrong158/knowledge, already private and already cambium's org store) with Pages left disabled.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [
+      "dec-014-f951"
+    ],
+    "tags": [
+      "cambium",
+      "dashboard",
+      "privacy",
+      "publishing",
+      "tailscale",
+      "snapshot"
+    ],
+    "retrieval_hints": [
+      "why is the dashboard not on github pages",
+      "is a private repo pages site public",
+      "how do I see the memory dashboard on my phone",
+      "where does snapshot.json go",
+      "CAMBIUM_PROJECTS why explicit"
+    ],
+    "origin": "user",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-08-16T16:37:16.560359+00:00",
+    "updated_at": "2026-08-16T16:37:16.560359+00:00",
+    "verified_at": "2026-08-16T16:37:16.560359+00:00",
+    "verified_sha": "603d6be33d2ba54214c47c9337c41a55203dc764"
+  },
+  {
+    "id": "dec-016-4b23",
+    "summary": "Pages synthesize by traversing the entry graph (resolved references, supersession as change history, cross-entry tension detection), structured by role rather than file order \u2014 and stay deterministic and model-free.",
+    "problem": "The first page tier grouped entries by tag, sorted by id, bolded field names and appended a source list. Every sentence was copied verbatim from a single entry, related_to rendered as a bare id, and supersession did not appear at all. Challenged directly on whether this was synthesis or just a log, the honest answer was that it was selection plus formatting - a log with a table of contents - and that no page said anything that was not already in one entry.",
+    "why_chosen": "The material for real synthesis was already in the stores and simply unread: related_to, constraints_created, enforced_by and superseded_by form a graph whose every edge was an inert id in the JSON. Resolving those edges produces statements no single entry contains - a rule naming the decision that created it, a change line quoting what a decision replaced and why it moved. Structuring by role (rules in force, then how it got decided, then what changed) is a genuine restructure of the material rather than a reordering, because it answers the questions in the order someone actually asks them. Staying deterministic and model-free was the load-bearing constraint: a model writing the prose would break delete-and-rebuild (the body would no longer be regenerable from entries alone) and would make staleness undecidable, since a rebuild that differs could mean the sources moved or merely that the model rephrased. Tension detection is limited to two checks - a reference pointing at an id not in the store, and entries sharing tags with no link either way - because anything verify_quality already judges must be left to it; two tools computing one judgement is how they come to disagree.",
+    "what_we_tried": "Rendering arcs forced sources to carry a role. Quoting a superseded predecessor means the page contains text from an entry the selector never chose, and marking those as ordinary sources made every page with any history permanently stale, since a predecessor is superseded by definition. Context sources fix it: content hashed (an edit to quoted text really does change what the page says) but status not treated as a cause. That established the invariant that every entry the body renders must be a tracked source, asserted by a test that scrapes entry ids out of the rendered markdown. Separately, the unlinked-pair heuristic counted the page's own selector tag toward shared tags, which every entry on a tag page shares by construction, turning a >=2 threshold into >=1 and flagging 143 of 221 real pages; excluding the selector tag brought it to 92, which is a true property of these stores rather than an artifact.",
+    "tradeoffs": "Synthesis quality is bounded by how well the stores are linked, and this mesh has 422 entries with 2 supersession edges and few related_to links - so the change-history sections are nearly empty today and the payoff grows only as linking improves. Deterministic synthesis can assemble and restructure but cannot summarize or reconcile in prose, which is the ceiling until and unless a separate model-written tier is added with its own contract.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [
+      "dec-014-f951"
+    ],
+    "tags": [
+      "cambium",
+      "pages",
+      "synthesis",
+      "graph",
+      "determinism",
+      "build-artifact"
+    ],
+    "retrieval_hints": [
+      "is the page tier synthesis or just a log",
+      "why do pages resolve related_to ids",
+      "why not use an LLM to write pages",
+      "context vs primary sources on a page",
+      "unlinked pair heuristic too noisy"
+    ],
+    "origin": "user",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-08-16T16:55:06.985804+00:00",
+    "updated_at": "2026-08-16T16:55:06.985804+00:00",
+    "verified_at": "2026-08-16T16:55:06.985804+00:00",
+    "verified_sha": "603d6be33d2ba54214c47c9337c41a55203dc764"
+  },
+  {
+    "id": "dec-017-a425",
+    "summary": "Pages get a reading surface via export_pages (an Obsidian vault), link backfill becomes automatic by running context-keeper's survey on every snapshot, and related-page links mean shared entries rather than same project.",
+    "problem": "Three gaps were left after the synthesis rewrite. Pages were worth reading but nothing read them - they existed only as JSON, and the dashboard showed counts rather than bodies. The supersession backfill required remembering to run a script, so it never happened, leaving 423 entries with 2 supersession edges and starving the synthesis of the graph it traverses. And every page linked to every sibling in its project.",
+    "why_chosen": "The wikilinks the pages already emit are Obsidian's [[slug]] format, so writing one file per page named after its slug turns the existing output into a navigable vault with working backlinks and zero new UI - the reading surface was one export away rather than a feature. Frontmatter doubles as Obsidian Properties so the vault is queryable without the body carrying metadata. For the backfill, automatic means automatically PROPOSED, never automatically applied: context-keeper's survey script is read-only by deliberate design because an edge written from a heuristic silently demotes a rule that may still be in force, so cambium runs it on every snapshot and surfaces the result in the dashboard where the user already looks, leaving the judgement human. It is delegated rather than reimplemented because the script scores pairs with the same function the write-time advisory uses, and a second implementation would drift until the two disagreed about what same subject means. On the third point, linking every sibling produced 17488 wikilinks across 221 pages, roughly 79 per page, which is a hairball in a vault graph and noise in a backlinks panel; overlap-based linking gives 2099 with none broken. Same lesson as the tension heuristic earlier in the session - a signal that fires everywhere is not a signal, and a link that is always present says nothing.",
+    "what_we_tried": "export_pages reaps orphaned files from its output directory so a deleted page cannot linger, but reaping in a directory a human may also use is dangerous, so every generated file carries a marker in its frontmatter and only marked files are ever deleted - verified by a test that drops a hand-written note in the vault and asserts it survives a re-export. The export is also byte-stable (no compiled_at in frontmatter) so a vault kept in git does not churn.",
+    "tradeoffs": "The vault contains full entry prose from every named project, so it is gitignored for the same reason as the snapshot. The link survey scans by root, so it reads more stores than are named; only named projects are surfaced, which keeps the explicit-map promise at the output boundary rather than the read boundary.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [
+      "dec-016-4b23",
+      "dec-014-f951"
+    ],
+    "tags": [
+      "cambium",
+      "pages",
+      "obsidian",
+      "supersession",
+      "backfill",
+      "dashboard"
+    ],
+    "retrieval_hints": [
+      "how do I read the compiled pages",
+      "obsidian vault export",
+      "why are supersession links proposed not applied",
+      "too many wikilinks hairball",
+      "automatic link backfill"
+    ],
+    "origin": "user",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-08-16T17:07:33.966851+00:00",
+    "updated_at": "2026-08-16T17:07:33.966851+00:00",
+    "verified_at": "2026-08-16T17:07:33.966851+00:00",
+    "verified_sha": "603d6be33d2ba54214c47c9337c41a55203dc764"
+  },
+  {
+    "id": "dec-018-0a86",
+    "summary": "A concept tier sits above the page tier: cross-project laws written by judgement, whose staleness against the corpus is computed. It is the dashboard's landing view, and one `refresh` command keeps every derived surface current.",
+    "problem": "The page tier synthesized per-tag-per-project, which is the wrong axis for the question the whole system exists to answer - \"what have we learned across everything\". There was no collective view, the synthesis lived in a vault file the user had to remember to open rather than in the dashboard, and every iteration required the user to ask for it. The LLM-wiki pattern names the gap: entity pages per CONCEPT drawn across all sources, with an incremental compile that reads new material against the existing wiki.",
+    "why_chosen": "The split that makes this work without a model is that writing a law takes judgement while detecting that it has fallen behind is a comparison. A law carries topic tags; the exporter finds every entry in the mesh carrying two or more of them, subtracts the ids the law already cites, and what remains is the next compile's work list - generated with nobody noticing it was needed, which is what \"it should iterate by itself\" actually requires. Two-or-more rather than any is load-bearing: single-tag matching flagged all 17 laws as behind, and a work list that fires on everything is not one, which is the corpus's own rule about detectors. Laws live in cambium's knowledge store rather than a document because the store is the authority and recall() already serves it to any agent in any project, so a future session gets \"systems fail by proceeding, not crashing\" before it writes code rather than after. _LESSONS.md became a generated projection of that store for the same reason a constraint must not restate a number its test owns - it had been hand-maintained for exactly one session before becoming a second copy that would drift silently. Revisions go through deprecate plus recapture rather than in-place edits, which leaves the supersession record this mesh almost entirely lacks.",
+    "what_we_tried": "The first compile pass ran end to end and moved 17 laws / 5 behind to 19 / 5, with two new laws that the evidence forced (CI on one machine is observation not verification; a CI config matching no branch is indistinguishable from one that passes). Three of this session's own bugs were instances of laws written minutes earlier: refresh reported laws_behind zero because it recomputed against an empty corpus, a check that could only ever return clean; the generated markdown looked corrupted only because it was inspected with PowerShell Get-Content, which reads BOM-less UTF-8 as cp1252 exactly as con-005 describes; and sharpening the candidate rule broke the test whose fixture encoded the old single-tag behaviour, caught only by the full suite because the targeted subsets filtered that test out by name.",
+    "tradeoffs": "Deterministic detection cannot judge which candidates actually belong in a law, so the compile pass still needs an agent; the mechanism only guarantees the work list exists and is ranked. Tag-overlap is a proxy for relevance and will miss an entry that belongs but is tagged differently. Laws sit at local scope, so recall() serves them only inside cambium until they are promoted to org - a gate that deliberately requires a human endorsement.",
+    "alternatives": [],
+    "constraints_created": [],
+    "related_to": [
+      "dec-016-4b23",
+      "dec-017-a425"
+    ],
+    "tags": [
+      "cambium",
+      "synthesis",
+      "concept-tier",
+      "dashboard",
+      "self-updating",
+      "llm-wiki"
+    ],
+    "retrieval_hints": [
+      "where is the everything we have learned view",
+      "how do laws know they are out of date",
+      "why two shared tags not one",
+      "why is LESSONS.md generated",
+      "cambium refresh command"
+    ],
+    "origin": "user",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-08-16T17:42:21.747097+00:00",
+    "updated_at": "2026-08-16T17:42:21.747097+00:00",
+    "verified_at": "2026-08-16T17:42:21.747097+00:00",
+    "verified_sha": "603d6be33d2ba54214c47c9337c41a55203dc764"
   }
 ]

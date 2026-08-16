@@ -17,6 +17,7 @@ Run:  python3 test_cambium.py
 
 import contextlib
 import importlib.util
+import inspect
 import json
 import os
 import shutil
@@ -58,6 +59,7 @@ CAMBIUM_ENV = [
     "CAMBIUM_REPO", "CAMBIUM_AGENT_ID", "CAMBIUM_ORG_REPO", "CAMBIUM_ORG_PR",
     "CAMBIUM_PROMOTE_RECALLS", "CAMBIUM_TEAM_BRANCH", "CAMBIUM_AGENTSYNC_BRANCH",
     "CAMBIUM_RELEASE_CAPTURE", "CAMBIUM_CONFIG_FILE", "CAMBIUM_MODE",
+    "CAMBIUM_PROJECTS", "CAMBIUM_CONTEXT_KEEPER", "CAMBIUM_SUPERSESSION_SURVEY",
 ]
 
 
@@ -1991,9 +1993,582 @@ def test_mcp_transport_capture_distill_recall():
 
 
 # --------------------------------------------------------------------------- #
+# pages — the synthesis tier compiled from context-keeper entries
+# --------------------------------------------------------------------------- #
+def _ctx_load(clone, fname):
+    with open(os.path.join(clone, ".context", fname), encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _ctx_save(clone, fname, entries):
+    with open(os.path.join(clone, ".context", fname), "w", encoding="utf-8") as f:
+        json.dump(entries, f, indent=2)
+
+
+def _extra_decision(eid, summary, tags):
+    return {"id": eid, "schema_version": 1, "summary": summary,
+            "problem": "a problem that needed deciding", "why_chosen": "because",
+            "what_we_tried": "", "tradeoffs": "", "tags": list(tags),
+            "related_to": [], "alternatives": [], "constraints_created": [],
+            "superseded_by": None, "status": "active",
+            "created_at": "2026-06-02T00:00:00+00:00",
+            "verified_at": "2026-06-02T00:00:00+00:00"}
+
+
+def test_page_compiles_from_entries_and_never_reaches_the_trust_tier():
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny")
+        r = json.loads(M.compile_page(tag="security"))
+        assert r["status"] == "compiled", r
+        page = r["page"]
+        assert sorted(page["sources"]) == ["con-001", "dec-001"], page
+        # dec-002 is deprecated, so it is neither a source nor a candidate
+        assert page["candidate_count"] == 2, page
+        assert page["stale"] is False, page
+        body = M._read_pages(M._cfg())["pages"][0]["body"]
+        assert "argon2id" in body, body
+        assert "`dec-001`" in body and "`con-001`" in body, body  # entry back-refs
+        # A page is NOT knowledge: it must not be an item, must not be recallable,
+        # and must not have been written into context-keeper's store.
+        assert M._read_local(M._cfg())["items"] == []
+        assert not json.loads(M.recall("argon2id memory hard"))["results"]
+        assert sorted(os.listdir(os.path.join(clones["jonny"], ".context"))) == [
+            "constraints.json", "decisions.json"]
+
+
+def test_page_goes_stale_when_a_source_is_superseded():
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny")
+        M.compile_page(tag="security")
+        assert json.loads(M.list_pages(stale_only=True))["count"] == 0
+        _supersede_decision(clones["jonny"], "dec-001")
+        r = json.loads(M.list_pages(stale_only=True))
+        assert r["stale_count"] == 1, r
+        causes = r["pages"][0]["stale_causes"]
+        assert any(c["entry_id"] == "dec-001" and c["cause"] == "superseded"
+                   for c in causes), causes
+
+
+def test_recompile_is_idempotent_on_an_unchanged_store():
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny")
+        first = json.loads(M.compile_page(tag="security"))
+        before = M._read_pages(M._cfg())["pages"][0]
+        r = json.loads(M.recompile(page_id=first["page"]["id"]))
+        assert r["recompiled"] == 1 and r["changed"] == 0, r
+        assert r["results"][0]["changed"] is False, r
+        after = M._read_pages(M._cfg())["pages"]
+        assert len(after) == 1, after          # recompile replaces, never appends
+        assert after[0]["identity"] == before["identity"]
+        assert after[0]["body"] == before["body"]
+
+
+def test_orphaned_source_is_named_not_silently_dropped():
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny")
+        M.compile_page(tag="security")
+        decs = [e for e in _ctx_load(clones["jonny"], "decisions.json")
+                if e["id"] != "dec-001"]
+        _ctx_save(clones["jonny"], "decisions.json", decs)
+        r = json.loads(M.list_pages())
+        causes = r["pages"][0]["stale_causes"]
+        assert r["pages"][0]["stale"] is True, r
+        assert any(c["entry_id"] == "dec-001" and c["cause"] == "orphaned"
+                   for c in causes), causes
+
+
+def test_pages_delete_and_rebuild_from_entries_alone():
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny")
+        M.compile_page(tag="security")
+        ident = M._read_pages(M._cfg())["pages"][0]["identity"]
+        os.remove(M._cfg()["pages_store"])
+        assert json.loads(M.list_pages())["count"] == 0
+        M.compile_page(tag="security")
+        rebuilt = M._read_pages(M._cfg())["pages"][0]
+        assert rebuilt["identity"] == ident, rebuilt
+
+
+def test_hand_edited_entry_is_stale_even_though_no_timestamp_moved():
+    """The store is documented as human-editable JSON, so an edit that never
+    touches updated_at is normal — and timestamp-based staleness would call the
+    page green while its source had changed underneath it."""
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny")
+        M.compile_page(tag="security")
+        decs = _ctx_load(clones["jonny"], "decisions.json")
+        stamps_before = {e["id"]: e.get("updated_at") for e in decs}
+        for e in decs:
+            if e["id"] == "dec-001":
+                e["why_chosen"] = "rewritten by hand, no timestamp bump"
+        _ctx_save(clones["jonny"], "decisions.json", decs)
+        after = _ctx_load(clones["jonny"], "decisions.json")
+        assert {e["id"]: e.get("updated_at") for e in after} == stamps_before
+        r = json.loads(M.list_pages(stale_only=True))
+        causes = r["pages"][0]["stale_causes"]
+        assert any(c["entry_id"] == "dec-001" and c["cause"] == "changed"
+                   for c in causes), causes
+
+
+def test_a_newly_recorded_entry_the_selector_matches_makes_the_page_stale():
+    """Source-diffing alone never sees this: the page's recorded sources are all
+    still fine, and the page is wrong anyway because something belongs on it."""
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny")
+        M.compile_page(tag="security")
+        decs = _ctx_load(clones["jonny"], "decisions.json")
+        decs.append(_extra_decision("dec-003", "Rotate signing keys quarterly",
+                                    ["security"]))
+        _ctx_save(clones["jonny"], "decisions.json", decs)
+        r = json.loads(M.list_pages(stale_only=True))
+        causes = r["pages"][0]["stale_causes"]
+        assert any(c["entry_id"] == "dec-003" and c["cause"] == "new_match"
+                   for c in causes), causes
+        # and recompiling absorbs it
+        json.loads(M.recompile(all_stale=True))
+        assert json.loads(M.list_pages(stale_only=True))["count"] == 0
+
+
+def test_compile_project_pages_the_untagged_entries_instead_of_dropping_them():
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny")
+        decs = _ctx_load(clones["jonny"], "decisions.json")
+        decs.append(_extra_decision("dec-003", "An entry nobody tagged", []))
+        _ctx_save(clones["jonny"], "decisions.json", decs)
+        r = json.loads(M.compile_project())
+        assert r["clusters"] == 1, r            # 'security'; 'auth' has only one
+        assert r["unfiled_entries"] == 1, r
+        assert r["coverage"]["on_a_cluster_page"] == 2, r
+        pages = M._read_pages(M._cfg())["pages"]
+        kinds = {p["selector"]["kind"] for p in pages}
+        assert {"tag", "unfiled", "index"} <= kinds, kinds
+        idx = next(p for p in pages if p["selector"]["kind"] == "index")
+        assert "[[" in idx["body"], idx["body"]   # wikilinks to the cluster pages
+        unfiled = next(p for p in pages if p["selector"]["kind"] == "unfiled")
+        assert [s["entry_id"] for s in unfiled["sources"]] == ["dec-003"], unfiled
+
+
+def test_page_synthesizes_the_graph_rather_than_listing_entries():
+    """The difference between a page and a log is that a page says things no
+    single entry says. Each assertion here is a statement assembled from two or
+    more entries: a resolved reference, a change line, or a detected tension."""
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny")
+        decs = _ctx_load(clones["jonny"], "decisions.json")
+        new = _extra_decision("dec-003", "Move password hashing to argon2id "
+                              "with tuned parameters", ["security", "auth"])
+        new["constraints_created"] = ["con-001"]   # a real edge...
+        new["related_to"] = ["dec-404"]            # ...and a dead one
+        decs.append(new)
+        # dec-003 replaces dec-001: the edge lives on the OLD entry, and the
+        # superseded original is therefore never selected — it reaches the page
+        # only as a resolved arc.
+        for e in decs:
+            if e["id"] == "dec-001":
+                e["status"], e["superseded_by"] = "superseded", "dec-003"
+        _ctx_save(clones["jonny"], "decisions.json", decs)
+
+        json.loads(M.compile_page(tag="security"))
+        page = M._read_pages(M._cfg())["pages"][0]
+        body = page["body"]
+
+        # 1. structured by role, not by entry order
+        assert "## Rules in force" in body, body
+        assert "## How this got decided" in body, body
+
+        # 2. the constraint names the decision that created it — an edge that
+        #    exists only by joining two entries
+        assert "Created by `dec-003`" in body, body
+
+        # 3. supersession rendered as change history, quoting the entry it
+        #    replaced. dec-001 is superseded so the selector never chose it;
+        #    it is on the page purely as a resolved arc.
+        assert "## What changed" in body, body
+        assert "supersedes `dec-001`" in body, body
+        assert 'was "Use argon2id' in body, body
+
+        # 4. a dead reference is asserted, not silently rendered as a bare id
+        assert "## Worth a look" in body, body
+        assert "dec-404" in body and "not in this store" in body, body
+
+        # 5. the quoted predecessor is tracked as a CONTEXT source: present, but
+        #    its superseded status is not a staleness cause
+        roles = {s["entry_id"]: s["role"] for s in page["sources"]}
+        assert roles.get("dec-001") == "context", roles
+        assert roles.get("dec-003") == "primary", roles
+        assert json.loads(M.list_pages(stale_only=True))["count"] == 0
+
+        # 6. THE INVARIANT: every entry id the body renders is a tracked source.
+        #    An untracked quote is drift the staleness check cannot see.
+        import re as _re
+        rendered = {m for m in _re.findall(r"`((?:dec|con|pipe)-[\w-]+)`", body)}
+        rendered -= {"dec-404"}          # deliberately dangling, not in the store
+        assert rendered <= set(roles), (rendered - set(roles), roles)
+
+        # ...while an edit to that quoted predecessor DOES make the page stale,
+        # because its text is rendered into the body
+        decs = _ctx_load(clones["jonny"], "decisions.json")
+        for e in decs:
+            if e["id"] == "dec-001":
+                e["summary"] = "Use bcrypt for password hashing"
+        _ctx_save(clones["jonny"], "decisions.json", decs)
+        stale = json.loads(M.list_pages(stale_only=True))
+        assert stale["count"] == 1, stale
+        assert any(c["entry_id"] == "dec-001" and c["cause"] == "changed"
+                   for c in stale["pages"][0]["stale_causes"]), stale
+
+
+def test_compile_project_leaves_no_page_stale_on_arrival():
+    """Every page a project compiles must be fresh the moment it exists.
+
+    It wasn't: `index` and `unfiled` pages carry no tag or topic, and the
+    staleness check re-ran the selector through the "no tag, no topic, so match
+    everything" branch — so both kinds reported every active entry in the
+    project as a new match. On the real stores that was 7 pages stale on
+    arrival; the seeded store was too small for the bug to show."""
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny")
+        decs = _ctx_load(clones["jonny"], "decisions.json")
+        decs.append(_extra_decision("dec-003", "An entry nobody tagged", []))
+        _ctx_save(clones["jonny"], "decisions.json", decs)
+        r = json.loads(M.compile_project())
+        assert r["unfiled_entries"] == 1, r
+        listing = json.loads(M.list_pages())
+        assert listing["count"] == 3, listing        # security, unfiled, index
+        assert listing["stale_count"] == 0, listing
+        # and a real change still registers on the unfiled page
+        decs.append(_extra_decision("dec-004", "another untagged one", []))
+        _ctx_save(clones["jonny"], "decisions.json", decs)
+        after = json.loads(M.list_pages(stale_only=True))
+        unfiled = next(p for p in after["pages"]
+                       if p["selector"]["kind"] == "unfiled")
+        assert any(c["entry_id"] == "dec-004" and c["cause"] == "new_match"
+                   for c in unfiled["stale_causes"]), unfiled
+
+
+def test_unknown_project_is_refused_with_the_names_that_would_work():
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny")
+        r = json.loads(M.compile_page(project="not-a-project", tag="security"))
+        assert "unknown project" in r["error"], r
+        assert "CAMBIUM_PROJECTS" in r["error"], r
+
+
+# --------------------------------------------------------------------------- #
+# snapshot export
+# --------------------------------------------------------------------------- #
+def test_export_snapshot_omits_entry_prose_unless_asked():
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny")
+        M.compile_page(tag="security")
+        out = os.path.join(root, "snap.json")
+        json.loads(M.export_snapshot(out=out))
+        raw = open(out, encoding="utf-8").read()
+        snap = json.loads(raw)
+        assert snap["includes_bodies"] is False, snap
+        # counts, ids and edges are all there...
+        proj = snap["projects"][0]
+        assert proj["counts"]["by_status"] == {"active": 2, "deprecated": 1}, proj
+        assert {n["id"] for n in proj["entries"]} == {"dec-001", "dec-002", "con-001"}
+        # ...but no entry text of any kind reached the file
+        assert "argon2id" not in raw, "entry prose leaked into a no-bodies snapshot"
+        assert all("title" not in n for n in proj["entries"]), proj
+        with_bodies = json.loads(M.export_snapshot(out=out, include_bodies=True))
+        assert with_bodies["includes_bodies"] is True
+        assert "argon2id" in open(out, encoding="utf-8").read()
+
+
+def test_export_snapshot_is_byte_stable_when_nothing_changed():
+    """No generated-at timestamp in the payload: committing the snapshot must
+    not churn git, and a diff must mean something actually moved."""
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny")
+        a, b = os.path.join(root, "a.json"), os.path.join(root, "b.json")
+        M.export_snapshot(out=a)
+        M.export_snapshot(out=b)
+        assert open(a, "rb").read() == open(b, "rb").read()
+        decs = _ctx_load(clones["jonny"], "decisions.json")
+        decs.append(_extra_decision("dec-003", "something new", ["security"]))
+        _ctx_save(clones["jonny"], "decisions.json", decs)
+        M.export_snapshot(out=b)
+        assert open(a, "rb").read() != open(b, "rb").read()
+
+
+def test_export_snapshot_never_renders_an_unchecked_quality_scan_as_clean():
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny")
+        os.environ.pop("CAMBIUM_CONTEXT_KEEPER", None)
+        snap = M._build_snapshot(M._cfg())
+        q = snap["projects"][0]["quality"]
+        assert q["checked"] is False, q
+        assert q["gaps"] is None, q          # NOT [] — an empty list draws as clean
+        assert "context-keeper" in q["reason"], q
+        assert snap["totals"]["projects_without_quality_check"] == 1, snap["totals"]
+
+
+def test_export_snapshot_marks_dangling_supersession_edges():
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny")
+        decs = _ctx_load(clones["jonny"], "decisions.json")
+        for e in decs:
+            if e["id"] == "dec-001":
+                e["status"], e["superseded_by"] = "superseded", "dec-002"
+            if e["id"] == "dec-002":
+                e["superseded_by"] = "dec-999"     # target does not exist
+        _ctx_save(clones["jonny"], "decisions.json", decs)
+        snap = M._build_snapshot(M._cfg())
+        edges = {e["from"]: e for e in snap["projects"][0]["supersession_edges"]}
+        assert edges["dec-001"]["to"] == "dec-002"
+        assert edges["dec-001"]["dangling"] is False, edges
+        assert edges["dec-002"]["dangling"] is True, edges
+
+
+def test_export_snapshot_carries_pages_and_their_staleness():
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny")
+        M.compile_page(tag="security")
+        _supersede_decision(clones["jonny"], "dec-001")
+        snap = M._build_snapshot(M._cfg())
+        proj = snap["projects"][0]
+        assert proj["stale_page_count"] == 1, proj
+        page = proj["pages"][0]
+        assert page["stale"] is True
+        assert any(c["entry_id"] == "dec-001" and c["cause"] == "superseded"
+                   for c in page["stale_causes"]), page
+
+
+def test_export_snapshot_spans_the_named_projects_and_reports_skips():
+    with lab(collaborators=("jonny", "stobie")) as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        seed_context_keeper(clones["stobie"])
+        be(clones, "jonny", CAMBIUM_PROJECTS="peer=%s,ghost=%s" % (
+            clones["stobie"], os.path.join(root, "nope")))
+        snap = M._build_snapshot(M._cfg())
+        assert sorted(p["name"] for p in snap["projects"]) == ["jonny", "peer"], snap
+        assert [s["name"] for s in snap["skipped_projects"]] == ["ghost"], snap
+        assert snap["totals"]["entries"] == 6, snap["totals"]
+
+
+def test_export_pages_writes_an_obsidian_vault_and_reaps_its_own_orphans():
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny")
+        decs = _ctx_load(clones["jonny"], "decisions.json")
+        decs.append(_extra_decision("dec-003", "An entry nobody tagged", []))
+        _ctx_save(clones["jonny"], "decisions.json", decs)
+        M.compile_project()
+        out = os.path.join(root, "vault")
+        r = json.loads(M.export_pages(out_dir=out))
+        assert r["written"] == 3, r          # security, unfiled, index
+        files = sorted(f for f in os.listdir(out) if f.endswith(".md"))
+
+        # Filenames ARE the wikilink targets: [[jonny-security]] -> that file.
+        idx = open(os.path.join(out, "jonny-index.md"), encoding="utf-8").read()
+        for link in ("[[jonny-security]]", "[[jonny-unfiled]]"):
+            target = link.strip("[]") + ".md"
+            assert link in idx, idx
+            assert target in files, (target, files)
+
+        assert idx.startswith("---\n"), idx        # Obsidian properties
+        assert "project: jonny" in idx and M.PAGES_MARKER in idx, idx
+
+        # A hand-written note in the vault is NOT ours and must survive a reap
+        note = os.path.join(out, "my-own-note.md")
+        with open(note, "w", encoding="utf-8") as f:
+            f.write("# mine\nnot cambium's\n")
+        # drop a cluster so one page disappears, then re-export
+        decs = [e for e in _ctx_load(clones["jonny"], "decisions.json")
+                if e["id"] != "dec-003"]
+        _ctx_save(clones["jonny"], "decisions.json", decs)
+        M.compile_project()
+        r2 = json.loads(M.export_pages(out_dir=out))
+        assert "jonny-unfiled.md" in r2["removed_orphans"], r2
+        assert os.path.exists(note), "reaped a file it did not write"
+
+
+def test_export_pages_is_byte_stable_and_flags_stale_pages_inline():
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny")
+        M.compile_page(tag="security")
+        out = os.path.join(root, "vault")
+        M.export_pages(out_dir=out)
+        first = open(os.path.join(out, "jonny-security.md"), "rb").read()
+        M.export_pages(out_dir=out)
+        assert open(os.path.join(out, "jonny-security.md"), "rb").read() == first
+
+        _supersede_decision(clones["jonny"], "dec-001")
+        M.export_pages(out_dir=out)
+        after = open(os.path.join(out, "jonny-security.md"), encoding="utf-8").read()
+        assert "stale: true" in after, after
+        assert "dec-001" in after and "superseded" in after, after
+
+
+def test_link_proposals_are_surfaced_automatically_and_never_written():
+    """The survey is read-only upstream on purpose. cambium's job is to run it
+    for you and put the result where you already look — never to apply it."""
+    if not os.path.exists(SURVEY_SCRIPT):
+        raise SkipTest("context-keeper sibling repo not found")
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny", CAMBIUM_SUPERSESSION_SURVEY=SURVEY_SCRIPT)
+        before = open(os.path.join(clones["jonny"], ".context", "decisions.json"),
+                      "rb").read()
+        snap = M._build_snapshot(M._cfg())
+        links = snap["projects"][0]["links"]
+        assert links["checked"] is True, links
+        assert isinstance(links["proposals"], list), links
+        assert "link_proposals" in snap["totals"], snap["totals"]
+        # the store is untouched
+        assert open(os.path.join(clones["jonny"], ".context", "decisions.json"),
+                    "rb").read() == before
+
+        # and with no survey wired, it reports unchecked rather than "none"
+        be(clones, "jonny")
+        os.environ.pop("CAMBIUM_CONTEXT_KEEPER", None)
+        bare = M._build_snapshot(M._cfg())["projects"][0]["links"]
+        assert bare["checked"] is False and bare["proposals"] is None, bare
+
+
+CK_SERVER = os.path.join(os.path.dirname(HERE), "context-keeper", "server.py")
+SURVEY_SCRIPT = os.path.join(os.path.dirname(HERE), "context-keeper", "scripts",
+                             "survey_supersessions.py")
+
+
+def test_quality_gaps_carry_a_real_issue_label():
+    """verify_quality's issues are {"type": ..., "detail": ...}. Reading the
+    wrong key produced gaps whose labels were empty strings — the dashboard drew
+    a bullet per finding with nothing in it, which reads as "no issue" for an
+    entry that has one."""
+    if not os.path.exists(CK_SERVER):
+        raise SkipTest("context-keeper sibling repo not found")
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny", CAMBIUM_CONTEXT_KEEPER=CK_SERVER)
+        q = M._build_snapshot(M._cfg())["projects"][0]["quality"]
+        assert q["checked"] is True, q
+        assert q["count"] >= 1, q
+        for gap in q["gaps"]:
+            assert gap["issues"], gap
+            for issue in gap["issues"]:
+                assert issue["type"] and issue["type"] != "?", gap
+                assert "detail" not in issue, "detail leaked without --bodies"
+        # ...and detail arrives when bodies are allowed
+        with_bodies = M._build_snapshot(M._cfg(), include_bodies=True)
+        gaps = with_bodies["projects"][0]["quality"]["gaps"]
+        assert any(i.get("detail") for g in gaps for i in g["issues"]), gaps
+
+
+def test_concept_pages_compute_their_own_unincorporated_evidence():
+    """The self-iteration signal. A law is written by judgement, but whether it
+    has fallen behind the corpus is a comparison: entries carrying its topic
+    tags, minus the ids it already cites. Non-empty means recompile."""
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny")
+        # con-001 gains a second tag so it shares TWO topics with the law.
+        # One shared tag is deliberately only a weak lead: broad tags match most
+        # of a corpus, and a work list that fires on everything is not one.
+        cons = _ctx_load(clones["jonny"], "constraints.json")
+        cons[0]["tags"] = ["security", "auth"]
+        _ctx_save(clones["jonny"], "constraints.json", cons)
+
+        M.capture(content="Secrets never reach logs.",
+                  kind="lesson",
+                  why="Established by dec-001, which chose argon2id.",
+                  tags="xylem-law cross-project security auth")
+        snap = M._build_snapshot(M._cfg())
+        laws = snap["lessons"]["laws"]
+        assert len(laws) == 1, laws
+        law = laws[0]
+        assert law["cites"] == ["dec-001"], law
+        # con-001 shares both topics and is NOT cited -> the work list
+        assert law["unincorporated"] == ["con-001"], law
+        assert law["unincorporated_count"] == 1
+        assert snap["lessons"]["needs_update"] == 1
+        assert law["evidence_projects"] == ["jonny"], law
+
+        # a single-topic match is counted as a weak lead, never as the work list
+        M.capture(content="Unrelated law about tagging.", kind="lesson",
+                  why="No citations at all.",
+                  tags="xylem-law cross-project security")
+        weak = next(l for l in M._build_snapshot(M._cfg())["lessons"]["laws"]
+                    if "Unrelated law" in l["law"])
+        assert weak["unincorporated"] == [], weak
+        assert weak["weak_leads"] == 2, weak   # dec-001 and con-001, one tag each
+        M.deprecate(item_id=weak["id"], reason="test fixture")
+
+        # citing it closes the gap without anyone re-running a scan
+        M.capture(content="Secrets never reach logs, and tokens never reach them either.",
+                  kind="lesson",
+                  why="Established by dec-001 and con-001.",
+                  tags="xylem-law cross-project security")
+        after = M._build_snapshot(M._cfg())["lessons"]
+        closed = [l for l in after["laws"] if l["unincorporated_count"] == 0]
+        assert len(closed) == 1, after["laws"]
+
+        # a law's own text is not entry prose, but its evidence quotes entries
+        bare = M._build_snapshot(M._cfg(), include_bodies=False)["lessons"]
+        assert all("evidence" not in l for l in bare["laws"]), bare
+
+
+def test_cli_export_snapshot_writes_the_file_and_bare_argv_stays_the_server():
+    with lab() as (root, origin, clones):
+        seed_context_keeper(clones["jonny"])
+        be(clones, "jonny")
+        out = os.path.join(root, "cli.json")
+        assert M._run_cli(["export-snapshot", "--out", out]) == 0
+        assert json.load(open(out, encoding="utf-8"))["schema"] == 1
+        assert M._run_cli(["export-snapshot", "--nope"]) == 2
+        assert M._run_cli(["not-a-command"]) == 2
+        assert M._run_cli([]) == 2          # bare --help path, not the server
+        # the MCP server path is what an empty sys.argv reaches, unchanged
+        assert "mcp.run()" in inspect.getsource(M.main)
+
+
+# --------------------------------------------------------------------------- #
 # runner
 # --------------------------------------------------------------------------- #
 TESTS = [
+    test_export_snapshot_omits_entry_prose_unless_asked,
+    test_export_snapshot_is_byte_stable_when_nothing_changed,
+    test_export_snapshot_never_renders_an_unchecked_quality_scan_as_clean,
+    test_export_snapshot_marks_dangling_supersession_edges,
+    test_export_snapshot_carries_pages_and_their_staleness,
+    test_export_snapshot_spans_the_named_projects_and_reports_skips,
+    test_quality_gaps_carry_a_real_issue_label,
+    test_export_pages_writes_an_obsidian_vault_and_reaps_its_own_orphans,
+    test_export_pages_is_byte_stable_and_flags_stale_pages_inline,
+    test_link_proposals_are_surfaced_automatically_and_never_written,
+    test_concept_pages_compute_their_own_unincorporated_evidence,
+    test_cli_export_snapshot_writes_the_file_and_bare_argv_stays_the_server,
+    test_page_compiles_from_entries_and_never_reaches_the_trust_tier,
+    test_page_goes_stale_when_a_source_is_superseded,
+    test_recompile_is_idempotent_on_an_unchanged_store,
+    test_orphaned_source_is_named_not_silently_dropped,
+    test_pages_delete_and_rebuild_from_entries_alone,
+    test_hand_edited_entry_is_stale_even_though_no_timestamp_moved,
+    test_a_newly_recorded_entry_the_selector_matches_makes_the_page_stale,
+    test_compile_project_pages_the_untagged_entries_instead_of_dropping_them,
+    test_page_synthesizes_the_graph_rather_than_listing_entries,
+    test_compile_project_leaves_no_page_stale_on_arrival,
+    test_unknown_project_is_refused_with_the_names_that_would_work,
     test_capture_and_recall_local,
     test_recall_abstains_on_nonsense,
     test_capture_validation,

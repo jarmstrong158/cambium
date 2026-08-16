@@ -105,6 +105,8 @@ overrides the config file per-key — the table is the full reference layer:
 | `CAMBIUM_PROMOTE_RECALLS` | no | `3` | recalls needed for local→team |
 | `CAMBIUM_RELEASE_CAPTURE` | no | off | `1` = also capture agentsync claims at their done/released transition (see below) |
 | `CAMBIUM_CONFIG_FILE` | no | `~/.cambium/config.json` | override the fallback config path (mainly for tests) |
+| `CAMBIUM_PROJECTS` | no | — | explicit `name`→repo-path map for pages and the snapshot, as a JSON object or `name=/abs/path` pairs. **Explicit on purpose**: a filesystem scan silently reads private and local-only stores; a name you typed cannot surprise you |
+| `CAMBIUM_CONTEXT_KEEPER` | no | `context-keeper` on `PATH` | path to context-keeper's `server.py` (or its console script) so `export_snapshot` can run `verify_quality`. Absent, the snapshot reports the scan as **not checked** rather than clean |
 
 ### Where the agentsync board lives (board addressing)
 
@@ -251,6 +253,108 @@ rather than creating one. No secrets written.
 **`status()`** — config state first: what's set, what's missing, each gap's cost
 and the `setup()` that fixes it (never raises when unconfigured). Once
 configured, also counts per scope/type, import watermarks, and wired substrates.
+
+### Pages — synthesis compiled from context-keeper entries
+
+A page is a **build artifact**, not knowledge. Pages live in
+`.cambium/pages.json` — a different file from `knowledge.json` — so they are
+structurally unreachable from `recall()` and every other trust-tier read, and
+cambium still never writes `.context/`, so they can't surface through
+`reload_constraints` either. Delete the file and recompile: nothing is lost,
+because nothing is authored there.
+
+**`compile_page(project, tag, topic, title)`** — one markdown page synthesised
+from the entries a tag or topic selects. Records the exact entry ids it compiled
+from, each with its status, `updated_at` and a **content hash**.
+
+A page is not a reformatted list of entries — it says things no single entry
+says, by traversing the graph the stores already carry:
+
+- **Rules in force** first, each with its hardness, scope, what enforces it, and
+  *the decision that created it* — an edge assembled by scanning every
+  decision's `constraints_created`.
+- **How this got decided**, oldest first, with `related_to` and
+  `constraints_created` resolved from bare ids into the rules and decisions they
+  actually name.
+- **What changed** — supersession rendered as history (`supersedes con-006: was
+  "the merge is additive-only" — changed because: …`), in context-keeper's own
+  `_predecessor_line` format so both surfaces read identically.
+- **Worth a look** — problems detectable only across entries: a reference
+  pointing at an id that isn't in the store, entries sharing tags with nothing
+  linking them. Heuristic, and labelled as such. Anything `verify_quality`
+  already judges is deliberately left to it.
+
+All deterministic and model-free, which is what keeps delete-and-rebuild and
+computed staleness working. Entries quoted but not selected (a superseded
+predecessor, an entry a reference names) are tracked as `context` sources: their
+text is hashed, but their superseded status isn't a staleness cause.
+
+**`compile_project(project, min_cluster)`** — one page per tag cluster plus an
+index that links them. Entries no cluster covers get an explicit `unfiled` page
+rather than being dropped — tags are free-form and `verify_quality` flags a
+`no_tags` population, so silent omission is the default failure here.
+
+**`list_pages(project, stale_only)`** — staleness, recomputed against the live
+store on every call and never inferred from age, with the entry that caused it:
+`superseded`, `deprecated`, `changed`, `orphaned`, or `new_match` (an entry the
+selector now matches that the page never compiled).
+
+**`recompile(page_id, all_stale)`** — rebuild. Reports `changed` per page, so a
+real rebuild is distinguishable from a refresh: `compiled_at` sits outside the
+page's identity hash, so an unchanged store recompiles byte-identically.
+
+> **Why a content hash and not `updated_at`.** These stores are documented as
+> human-editable JSON and get edited by hand, so a body can change with no
+> timestamp bump — and `_backfill_updated_at` stamps `updated_at` onto entries
+> that never changed. The hash is authoritative; the timestamp corroborates.
+
+**`export_pages(out_dir, project)`**, also `cambium-mcp export-pages [--out DIR]
+[--project NAME]` — writes every page as `<slug>.md`, which is exactly what the
+`[[slug]]` links point at. That is Obsidian's format, so opening the output
+directory as a vault gives working navigation and backlinks with no setup.
+Frontmatter carries project/sources/stale as Obsidian Properties, and a stale
+page gets a callout at the top. The directory is regenerated, not merged —
+orphaned files are reaped, but only ones carrying cambium's own marker.
+
+> Related-page links mean "these two pages share an entry", not "same project".
+> Linking every sibling produced 17,488 wikilinks across 221 pages and turned the
+> vault graph into a hairball; overlap-based linking gives 2,099. A link that is
+> always there says nothing.
+
+### Snapshot + dashboard
+
+**`export_snapshot(out, include_bodies)`**, also available as
+`cambium-mcp export-snapshot [--out PATH] [--bodies]` — the whole mesh as one
+JSON file: per project, entry counts by kind and status, every entry as a graph
+node, supersession edges (dangling ones marked), pages with their staleness, and
+context-keeper's `verify_quality` gaps. Entry prose is excluded unless
+`--bodies`. No generated-at timestamp, so an unchanged mesh exports
+byte-identically.
+
+It also runs context-keeper's `survey_supersessions.py` for every named project
+and carries the **proposed missing supersession links** — so the backfill is
+something you look at rather than something you remember to run. Delegated, not
+reimplemented: the script scores pairs with the same function the write-time
+advisory uses, so a backfilled link matches what would have been suggested at
+the time. **Nothing is ever written to a store** — an edge written from a
+heuristic silently demotes a rule that may still be in force, so cambium
+proposes and you decide.
+
+A project whose quality scan or link survey could not run reports
+`checked: false` with the reason and a `null` list — never `[]`, which a
+dashboard draws as clean. Set `CAMBIUM_CONTEXT_KEEPER` to context-keeper's
+`server.py` to enable both.
+
+`../xylem-dashboard` renders it: a static, offline-capable, installable app with
+no build step and no network calls.
+
+> **It is not publishable.** The snapshot spans every project in
+> `CAMBIUM_PROJECTS`, including private repos and ones with no remote — the same
+> reason `dashboard.html` is gitignored here and `con-015-12da` exists in
+> context-keeper. Note that a **GitHub Pages site built from a private repo is
+> still public**, so the dashboard is served from your own machine and reached
+> over Tailscale. `.cambium/pages.json` and `.cambium/snapshot.json` are
+> gitignored.
 
 ## The compound-growth loop
 

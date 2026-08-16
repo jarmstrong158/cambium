@@ -141,6 +141,129 @@ every real path of concern already ends in a filename the file-tell catches. A
 false block is more expensive than a false pass here — `force=True` and the
 `review_promotions` backstop both catch what the lint lets through.
 
+## Decision 7a — a page synthesises the graph; a page that only reformats is a log
+
+The first version of the page tier failed its own premise, and it is worth
+recording why rather than quietly fixing it. It grouped entries by tag, sorted
+them by id, bolded the field names and appended a source list. Every sentence
+was copied verbatim from one entry; nothing on a page was derived from more than
+one entry at a time. `related_to` rendered as a bare id. Supersession — the one
+place these stores encode change over time — did not appear at all. That is
+selection plus formatting: a log with a table of contents.
+
+What makes a page a synthesis is that it says things **no single entry says**,
+and the material for that was already in the stores, unread: `related_to`,
+`constraints_created`, `enforced_by` and `superseded_by` are a graph, and every
+edge was an id sitting inert in the JSON. So:
+
+- **References resolve to statements.** `con-011` becomes the rule it names. A
+  constraint says which decision created it — assembled by scanning every
+  decision's `constraints_created`, an edge nothing was following.
+- **Structure by role, not by file order.** Rules in force first (they govern
+  what you may do next), then how it got decided, then what changed. The
+  entries are the same; the document is not.
+- **Supersession renders as change history**, in context-keeper's own
+  `_predecessor_line` format so both surfaces read identically.
+- **Tensions are asserted across entries**: a reference pointing at an id not in
+  the store, and entries sharing tags with no link either way. Deliberately only
+  these two — anything `verify_quality` already judges is left to it, because
+  two tools computing one judgement is how they come to disagree.
+
+This stays **deterministic and model-free**, which is what keeps Decision 7's
+delete-and-rebuild property and computed staleness intact. A model writing the
+prose would break both: the body would no longer be regenerable from entries
+alone, and staleness could not distinguish a moved source from a rephrasing.
+
+Two things this forced, both non-obvious:
+
+**Sources have a role.** Rendering an arc means quoting entries the selector
+never chose — a superseded predecessor, an entry named by a reference. Those are
+tracked as `context` sources: their content is hashed (an edit to quoted text
+changes what the page says, so the page really is stale) but their status is
+not a cause, since a predecessor is superseded *by definition* and treating that
+as drift would leave every page with any history permanently stale. The
+invariant is **every entry the body renders is a tracked source**; an untracked
+quote is drift the staleness check cannot see, and a test asserts it by scraping
+the ids out of the rendered markdown.
+
+**A heuristic that fires everywhere is not a signal.** The unlinked-pair check
+counted the page's own selector tag toward "shared tags", which every entry on a
+tag page shares by construction — turning a >=2 threshold into >=1 and flagging
+143 of 221 real pages. Excluding the selector's tag brought it to 92, which is
+a real property of these stores (422 entries carry almost no `related_to` links)
+rather than an artifact of the check.
+
+## Decision 7 — pages are build artifacts, and the tier boundary is structural
+
+A page synthesises context-keeper entries into readable markdown. That makes it
+*derived*, and derived knowledge must never be mistaken for the thing it was
+derived from: a summary that can be recalled, cited, and promoted would let a
+lossy restatement climb to org scope and outrank its own sources.
+
+The guarantee is structural rather than a rule to remember. Pages live in
+`.cambium/pages.json`, a different file from `knowledge.json`, because every
+trust-tier read (`recall`, `session_primer`, `export_markdown`, `stale_report`,
+`review_promotions`) iterates `data["items"]`. A page cannot reach any of them
+because it is not there. The other half is already guaranteed by Decision 1:
+cambium never writes `.context/`, so a page can never surface through
+context-keeper's `reload_constraints` either. Deleting `pages.json` loses
+nothing — every page rebuilds from `.context/` alone.
+
+**Staleness is computed, and the content hash is what computes it.** Each page
+records, per source entry, its id, status, `updated_at` *and* a hash of its
+meaning (all fields except lifecycle/bookkeeping ones). The hash is authoritative
+and the timestamp is corroborating, because both directions of timestamp error
+are real in these stores: they are documented as human-editable JSON and are
+edited by hand, so a body can change with no bump; and `_backfill_updated_at`
+stamps `updated_at` onto entries that never changed. A page goes stale when a
+source is superseded, deprecated, content-changed, or gone — and, separately,
+when the selector now matches an entry the page never compiled. That last cause
+is not source-diffing at all: a tag page on an active project is most often wrong
+by *omission*, and nothing in a per-source comparison can see it.
+
+`compiled_at` is deliberately outside the page's `identity` hash. context-keeper
+learned the same thing in `export_snapshot`: a timestamp inside the artifact
+churns git on every run and makes "recompiling changed nothing" untestable.
+
+Two things the first implementation got wrong, both worth keeping written down.
+Pages whose selector is not a function of entries — the `index` page, and the
+`unfiled` page — fell through `_select_entries`' "no tag, no topic, so match
+everything" branch, so every one of them was stale the moment it was compiled
+(7 pages, on the real stores; the seeded test store was too small to show it).
+And the `unfiled` selector now records the cluster floor it was built with,
+because a page compiled at `min_cluster=3` has a different uncovered set than the
+default and would otherwise report drift that never happened.
+
+## Decision 8 — the snapshot is explicit about what it read and what it could not
+
+`export_snapshot` writes the whole mesh as one JSON file for a static dashboard.
+Two rules shape it, and both are the same rule the rest of this codebase keeps
+rediscovering: **a thing that was not checked must not render as a thing that
+checked clean.**
+
+- `verify_quality` belongs to context-keeper, so cambium shells out to its CLI
+  rather than importing it (Decision 1 again: read substrates in place, never
+  couple to the other tool's code). When that call cannot be made, the snapshot
+  says `checked: false` with the reason and `gaps: null` — never `gaps: []`,
+  which a dashboard draws as a clean bill of health.
+- The projects it reads come from an explicit `CAMBIUM_PROJECTS` map, never a
+  filesystem scan. A scan silently pulls in private repos and local-only
+  projects; a name someone typed cannot surprise them. Projects named but
+  missing a store are reported as `skipped_projects` rather than simply absent.
+
+Entry prose is excluded unless `include_bodies` is set — including the `summary`
+and issue `detail` that `verify_quality` echoes back, which are entry text
+wearing a different name.
+
+**On publishing it: the snapshot is not publishable.** It spans every named
+project, which on this machine includes a private repo and one with no remote.
+`con-015-12da` in context-keeper forbids committing cross-store derived artifacts
+to a public repo, and `dashboard.html` is gitignored here for the same reason. A
+GitHub Pages site built from a *private* repo is still a public website, so
+"make the repo private" does not resolve it. The dashboard is therefore served
+from the operator's own machine and reached over Tailscale; both `pages.json` and
+`snapshot.json` are gitignored.
+
 ## What is deliberately NOT here
 
 - **Real-time sync / A2A transport** — same argument as agentsync's DESIGN:
