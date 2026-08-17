@@ -4008,7 +4008,7 @@ def _empty_decisions():
     verdict here changes what the reviewer reads, never what the store says.
     The tap is still the gate."""
     return {"dismissed_links": [], "law_citations": {}, "law_dismissed": {},
-            "link_evals": {}}
+            "link_evals": {}, "law_evals": {}}
 
 
 def _read_decisions(cfg):
@@ -4124,6 +4124,14 @@ def _lessons_block(cfg, include_bodies, mesh):
                 # moved past the page and it is due a recompile.
                 "unincorporated": unincorporated[:40],
                 "unincorporated_count": len(unincorporated),
+                # An agent's read on a candidate, keyed law:entry. Advisory in
+                # exactly the way a link verdict is: it says whether the law
+                # SHOULD account for the entry and what would change, and the
+                # citation is still only written by a tap.
+                "unincorporated_evals": {
+                    e: v for e, v in (
+                        (e, decided["law_evals"].get("%s:%s" % (item.get("id"), e)))
+                        for e in unincorporated[:40]) if v},
                 # Single-tag matches, counted but not listed. Reported so the
                 # narrowing is visible rather than looking like there was
                 # nothing else there.
