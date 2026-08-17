@@ -4300,6 +4300,40 @@ def _project_snapshot(cfg, name, context_dir, pages, include_bodies,
     }
 
 
+# What can actually be DONE about each issue, which is the only question a
+# reviewer is asking. A single total treats "one tap fixes this" and "this
+# clears itself in a week" and "somebody must read code" as the same
+# outstanding item, so the number never moves and the surface reads as broken.
+GAP_CLASSES = {
+    "auto":    "one tap; the drain applies it with no judgement",
+    "review":  "needs authored text, then your approval",
+    "waiting": "already remediated; clears itself once retrieval catches up",
+    "blocked": "needs the code re-read before anything may be written",
+}
+
+
+def _classify_gap(issue_type, entry):
+    """Which bucket one issue on one entry falls in.
+
+    Mirrors what apply_queue's drain will actually do, deliberately: a card that
+    promises a one-tap fix the drain then declines is worse than no card."""
+    if issue_type == "code_drift":
+        return "blocked"
+    drifted = False  # caller passes entry already known non-drifted for isolated
+    if issue_type == "isolated":
+        return "blocked" if drifted else "auto"
+    if issue_type == "legacy":
+        return ("auto" if (entry.get("rationale") or "").strip()
+                and not (entry.get("why_chosen") or "").strip() else "review")
+    if issue_type == "unused":
+        # Hints are written; the counter only moves when the entry is actually
+        # returned by a query, which no edit can force.
+        return "waiting" if (entry.get("retrieval_hints") or []) else "auto"
+    if issue_type == "no_tags":
+        return "auto"
+    return "review"
+
+
 def _project_quality(cfg, name, context_dir, include_bodies, links):
     """verify_quality's gaps, plus whether a repair has already been asked for.
 
@@ -4310,6 +4344,26 @@ def _project_quality(cfg, name, context_dir, include_bodies, links):
     q = _quality_gaps(os.path.dirname(context_dir), include_bodies)
     if "quality:%s" % name in ((links or {}).get("awaiting") or set()):
         q["awaiting_repair"] = True
+
+    # Classify every issue so the card can say what a tap will DO, rather than
+    # showing one total that never moves.
+    if q.get("checked"):
+        entries = _read_entries(context_dir)
+        counts = dict.fromkeys(GAP_CLASSES, 0)
+        for g in (q.get("gaps") or []):
+            types = [i.get("type") for i in g.get("issues", [])]
+            rec = entries.get(g.get("id"))
+            entry = rec[2] if rec else {}
+            has_drift = "code_drift" in types
+            for t in types:
+                # isolated on a drifted entry is unreachable until the drift is
+                # resolved, because writing to it would clear the drift flag.
+                cls = "blocked" if (t == "isolated" and has_drift) \
+                    else _classify_gap(t, entry)
+                counts[cls] += 1
+        q["gap_classes"] = counts
+        q["fixable_now"] = counts["auto"]
+
     # Proposed edits awaiting a ruling. A repair that changes an entry's TEXT is
     # judgement, so it belongs on the same footing as a supersession: proposed
     # with its reasoning, applied only by a tap. Repairs used to be written
