@@ -4008,7 +4008,8 @@ def _empty_decisions():
     verdict here changes what the reviewer reads, never what the store says.
     The tap is still the gate."""
     return {"dismissed_links": [], "law_citations": {}, "law_dismissed": {},
-            "link_evals": {}, "law_evals": {}, "eval_pending": []}
+            "link_evals": {}, "law_evals": {}, "eval_pending": [],
+            "repair_proposals": {}, "repair_dismissed": []}
 
 
 def _read_decisions(cfg):
@@ -4239,7 +4240,9 @@ def _link_proposals(cfg):
             "threshold": data.get("threshold"),
             "dismissed": decisions["dismissed_links"],
             "evals": decisions["link_evals"],
-            "awaiting": set(decisions["eval_pending"])}
+            "awaiting": set(decisions["eval_pending"]),
+            "repairs": {k: v for k, v in decisions["repair_proposals"].items()
+                        if k not in set(decisions["repair_dismissed"])}}
 
 
 def _project_snapshot(cfg, name, context_dir, pages, include_bodies,
@@ -4307,6 +4310,18 @@ def _project_quality(cfg, name, context_dir, include_bodies, links):
     q = _quality_gaps(os.path.dirname(context_dir), include_bodies)
     if "quality:%s" % name in ((links or {}).get("awaiting") or set()):
         q["awaiting_repair"] = True
+    # Proposed edits awaiting a ruling. A repair that changes an entry's TEXT is
+    # judgement, so it belongs on the same footing as a supersession: proposed
+    # with its reasoning, applied only by a tap. Repairs used to be written
+    # directly, which made this the one surface with no approval step at all.
+    props = (links or {}).get("repairs") or {}
+    mine = [dict(v, key=k) for k, v in sorted(props.items())
+            if v.get("project") == name]
+    if mine:
+        q["repair_proposals"] = mine if include_bodies else [
+            {k2: v2 for k2, v2 in m.items() if k2 not in ("current", "proposed")}
+            for m in mine]
+        q["repair_proposal_count"] = len(mine)
     return q
 
 

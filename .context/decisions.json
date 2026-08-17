@@ -8,7 +8,13 @@
     "tradeoffs": "Two known frictions surfaced (recorded as constraints): cambium's lexical recall missed con-016 for the phrase 'documentation sync rule' (endorsement path used instead of recall), and parallel org PRs conflicted on knowledge.json.",
     "alternatives": [],
     "constraints_created": [],
-    "related_to": [],
+    "related_to": [
+      "con-001-491f",
+      "con-002-3860",
+      "dec-002-cea7",
+      "dec-004-f4d5",
+      "dec-006-d1f9"
+    ],
     "tags": [
       "cambium",
       "knowledge-federation",
@@ -23,8 +29,9 @@
     "status": "active",
     "superseded_by": null,
     "created_at": "2026-07-10T17:22:21.500291+00:00",
-    "updated_at": "2026-07-10T17:22:21.500291+00:00",
-    "verified_at": "2026-07-10T17:22:21.500291+00:00"
+    "updated_at": "2026-08-17T03:12:34.328791+00:00",
+    "verified_at": "2026-08-17T03:12:34.303774+00:00",
+    "verified_sha": "b1deb2fbe77d2e0203a44699698a3ce3cef3fca4"
   },
   {
     "id": "dec-002-cea7",
@@ -35,7 +42,13 @@
     "tradeoffs": "Repair happens at ingest, so items already corrupted in a store are not retroactively cleaned by this change alone (handled separately by a data fix / re-render). Normalization runs on every write, a negligible cost since the guard short-circuits on pure-ASCII text.",
     "alternatives": [],
     "constraints_created": [],
-    "related_to": [],
+    "related_to": [
+      "con-001-491f",
+      "dec-001-bb93",
+      "dec-003-82c7",
+      "dec-004-f4d5",
+      "dec-006-d1f9"
+    ],
     "tags": [
       "encoding",
       "mojibake",
@@ -54,8 +67,9 @@
     "status": "active",
     "superseded_by": null,
     "created_at": "2026-07-12T14:59:28.484046+00:00",
-    "updated_at": "2026-07-12T14:59:28.484046+00:00",
-    "verified_at": "2026-07-12T14:59:28.484046+00:00"
+    "updated_at": "2026-08-17T03:12:34.603650+00:00",
+    "verified_at": "2026-08-17T03:12:34.578771+00:00",
+    "verified_sha": "b1deb2fbe77d2e0203a44699698a3ce3cef3fca4"
   },
   {
     "id": "dec-003-82c7",
@@ -66,7 +80,13 @@
     "tradeoffs": "The lint is precision-biased, not exhaustive: a bare word/word 'path' is deliberately NOT a tell (prose uses slashes for lists like survey/claim/update_status, and real paths of concern end in a filename the file-tell catches), so a bare directory path with no filename/project-name can slip through. Accepted because a false block is costlier than a false pass here, and force=True plus the review_promotions backstop catch the remainder.",
     "alternatives": [],
     "constraints_created": [],
-    "related_to": [],
+    "related_to": [
+      "dec-002-cea7",
+      "dec-004-f4d5",
+      "dec-005-d6e5",
+      "dec-006-d1f9",
+      "dec-007-ffec"
+    ],
     "tags": [
       "promotion",
       "org-scope",
@@ -87,8 +107,9 @@
     "status": "active",
     "superseded_by": null,
     "created_at": "2026-07-12T15:31:11.510527+00:00",
-    "updated_at": "2026-07-12T15:31:11.510527+00:00",
-    "verified_at": "2026-07-12T15:31:11.510527+00:00"
+    "updated_at": "2026-08-17T03:12:34.918096+00:00",
+    "verified_at": "2026-08-17T03:12:34.895486+00:00",
+    "verified_sha": "b1deb2fbe77d2e0203a44699698a3ce3cef3fca4"
   },
   {
     "id": "dec-004-f4d5",
@@ -99,7 +120,13 @@
     "tradeoffs": "",
     "alternatives": [],
     "constraints_created": [],
-    "related_to": [],
+    "related_to": [
+      "con-001-491f",
+      "dec-001-bb93",
+      "dec-002-cea7",
+      "dec-003-82c7",
+      "dec-005-d6e5"
+    ],
     "tags": [
       "generalize",
       "remediation",
@@ -119,8 +146,9 @@
     "status": "active",
     "superseded_by": null,
     "created_at": "2026-07-12T16:00:34.372851+00:00",
-    "updated_at": "2026-07-12T16:00:34.372851+00:00",
-    "verified_at": "2026-07-12T16:00:34.372851+00:00"
+    "updated_at": "2026-08-17T03:12:35.174922+00:00",
+    "verified_at": "2026-08-17T03:12:35.152896+00:00",
+    "verified_sha": "b1deb2fbe77d2e0203a44699698a3ce3cef3fca4"
   },
   {
     "id": "dec-005-d6e5",
@@ -131,7 +159,10 @@
     "tradeoffs": "",
     "alternatives": [],
     "constraints_created": [],
-    "related_to": [],
+    "related_to": [
+      "dec-003-82c7",
+      "dec-004-f4d5"
+    ],
     "tags": [
       "cwd-aware",
       "solo-operator",
@@ -150,8 +181,9 @@
     "status": "active",
     "superseded_by": null,
     "created_at": "2026-07-12T17:11:48.488767+00:00",
-    "updated_at": "2026-07-12T17:11:48.488767+00:00",
-    "verified_at": "2026-07-12T17:11:48.488767+00:00"
+    "updated_at": "2026-08-17T03:12:35.441310+00:00",
+    "verified_at": "2026-08-17T03:12:35.420499+00:00",
+    "verified_sha": "b1deb2fbe77d2e0203a44699698a3ce3cef3fca4"
   },
   {
     "id": "dec-006-d1f9",
@@ -164,7 +196,13 @@
     "constraints_created": [
       "Re-run bench_recall.py when the cambium knowledge base crosses ~100 items; build hybrid embedding recall only if paraphrase top-1 drops below ~70% OR a gold item falls below the abstention floor. Homonym collisions alone are not a trigger; fix tags instead."
     ],
-    "related_to": [],
+    "related_to": [
+      "con-001-491f",
+      "con-002-3860",
+      "dec-001-bb93",
+      "dec-002-cea7",
+      "dec-003-82c7"
+    ],
     "tags": [
       "cambium",
       "recall",
@@ -184,8 +222,9 @@
     "status": "active",
     "superseded_by": null,
     "created_at": "2026-07-12T22:10:58.257221+00:00",
-    "updated_at": "2026-07-12T22:10:58.257221+00:00",
-    "verified_at": "2026-07-12T22:10:58.257221+00:00"
+    "updated_at": "2026-08-17T03:12:35.724890+00:00",
+    "verified_at": "2026-08-17T03:12:35.703832+00:00",
+    "verified_sha": "b1deb2fbe77d2e0203a44699698a3ce3cef3fca4"
   },
   {
     "id": "dec-007-ffec",
@@ -198,7 +237,13 @@
     "constraints_created": [
       "The solo fast-lane must never relax cambium's generalization gate (_org_body_smells_local): a project-specific body always requires an org_content restatement (or force=True) before promotion to org, regardless of solo/team mode."
     ],
-    "related_to": [],
+    "related_to": [
+      "con-001-491f",
+      "con-002-3860",
+      "dec-001-bb93",
+      "dec-003-82c7",
+      "dec-006-d1f9"
+    ],
     "tags": [
       "cambium",
       "promotion",
@@ -217,8 +262,9 @@
     "status": "active",
     "superseded_by": null,
     "created_at": "2026-07-14T23:39:14.260479+00:00",
-    "updated_at": "2026-07-14T23:39:14.260479+00:00",
-    "verified_at": "2026-07-14T23:39:14.260479+00:00"
+    "updated_at": "2026-08-17T03:12:36.091717+00:00",
+    "verified_at": "2026-08-17T03:12:36.070522+00:00",
+    "verified_sha": "b1deb2fbe77d2e0203a44699698a3ce3cef3fca4"
   },
   {
     "id": "dec-008-7aa6",
@@ -229,7 +275,13 @@
     "tradeoffs": "A purely-local item (only ever recalled by its owner) now needs multi-day use OR an endorsement to promote by recalls, not N recalls in one session. recall_marks grows per (agent,day) on each item (bounded, trimmable later). deprecate is retire-only; reactivation stays a manual JSON edit.",
     "alternatives": [],
     "constraints_created": [],
-    "related_to": [],
+    "related_to": [
+      "con-001-491f",
+      "con-002-3860",
+      "dec-001-bb93",
+      "dec-002-cea7",
+      "dec-003-82c7"
+    ],
     "tags": [
       "cambium",
       "durability",
@@ -244,8 +296,9 @@
     "status": "active",
     "superseded_by": null,
     "created_at": "2026-07-21T12:14:59.394763+00:00",
-    "updated_at": "2026-07-21T12:14:59.394763+00:00",
-    "verified_at": "2026-07-21T12:14:59.394763+00:00"
+    "updated_at": "2026-08-17T03:12:36.345381+00:00",
+    "verified_at": "2026-08-17T03:12:36.321391+00:00",
+    "verified_sha": "b1deb2fbe77d2e0203a44699698a3ce3cef3fca4"
   },
   {
     "id": "dec-009-b97e",
@@ -355,7 +408,9 @@
     "constraints_created": [
       "Before enriching an MCP tool description for score reasons, measure the tools/list token delta and justify it per tool. Verbosity is a per-session cost paid by every user, and Glama's scoring weights the minimum tool at 40%, so only the weakest tools are worth the tax."
     ],
-    "related_to": [],
+    "related_to": [
+      "con-003-e8ba"
+    ],
     "tags": [
       "mcp",
       "glama",
@@ -374,9 +429,9 @@
     "status": "active",
     "superseded_by": null,
     "created_at": "2026-08-02T11:24:50.962532+00:00",
-    "updated_at": "2026-08-02T11:24:50.962532+00:00",
-    "verified_at": "2026-08-02T11:24:50.962532+00:00",
-    "verified_sha": "12efd0d949c34a1f309f4f1056b8464352940698"
+    "updated_at": "2026-08-17T03:12:36.653856+00:00",
+    "verified_at": "2026-08-17T03:12:36.632980+00:00",
+    "verified_sha": "b1deb2fbe77d2e0203a44699698a3ce3cef3fca4"
   },
   {
     "id": "dec-013-220d",
@@ -446,7 +501,13 @@
     "constraints_created": [
       "Pages must never be written into .context/ or knowledge.json"
     ],
-    "related_to": [],
+    "related_to": [
+      "con-001-491f",
+      "con-002-3860",
+      "dec-001-bb93",
+      "dec-006-d1f9",
+      "dec-007-ffec"
+    ],
     "tags": [
       "cambium",
       "pages",
@@ -467,9 +528,9 @@
     "status": "active",
     "superseded_by": null,
     "created_at": "2026-08-16T16:36:57.480466+00:00",
-    "updated_at": "2026-08-16T16:36:57.480466+00:00",
-    "verified_at": "2026-08-16T16:36:57.480466+00:00",
-    "verified_sha": "603d6be33d2ba54214c47c9337c41a55203dc764"
+    "updated_at": "2026-08-17T03:12:37.024703+00:00",
+    "verified_at": "2026-08-17T03:12:37.003868+00:00",
+    "verified_sha": "b1deb2fbe77d2e0203a44699698a3ce3cef3fca4"
   },
   {
     "id": "dec-015-71d6",

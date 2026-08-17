@@ -118,7 +118,7 @@
     "reason": "Cloudflare serves a matching static asset BEFORE invoking the Worker script unless run_worker_first is set. A Worker whose fetch handler checks a path token therefore never runs for any path that matches an uploaded file, so the auth check is silently absent on exactly the URLs that matter. The failure presents as a completely normal successful deploy: wrangler reports success, the Worker exists, the code is correct, and the credential check is simply never reached. There is no error anywhere.",
     "triggering_incident": "2026-08-16: deployed a token-gated dashboard Worker with [assets] pointing at a bundle containing snapshot.json - 869KB of cross-project memory with entry bodies from 20 projects, several private and one with no remote. The gate code was correct but never executed: https://<worker>.workers.dev/snapshot.json returned the full file to unauthenticated requests. Caught within about four minutes by the post-deploy gate test, which requested protected paths without the token and expected 404. Remediation had to be a deny-all Worker deployed over the same name, because `wrangler delete` left the edge serving the old assets for at least a minute. Worse, a --no-data build flag had been written specifically to prevent this and was used for an earlier Pages attempt, then skipped for the Worker deploy - the safety mechanism existed and was bypassed by the person who built it.",
     "enforced_by": "",
-    "scope": "worker/wrangler.toml",
+    "scope": "global",
     "hardness": "absolute",
     "related_to": [
       "dec-015-71d6",
@@ -143,9 +143,9 @@
     "schema_version": 4,
     "status": "active",
     "created_at": "2026-08-16T20:27:50.676194+00:00",
-    "updated_at": "2026-08-16T20:27:57.069769+00:00",
-    "verified_at": "2026-08-16T20:27:57.031415+00:00",
-    "verified_sha": "efd91c10daea3b8070115d381f7c966fb1404483"
+    "updated_at": "2026-08-17T10:13:42.850088+00:00",
+    "verified_at": "2026-08-17T10:13:42.827676+00:00",
+    "verified_sha": "b1deb2fbe77d2e0203a44699698a3ce3cef3fca4"
   },
   {
     "id": "con-006-1f03",
@@ -155,7 +155,10 @@
     "enforced_by": "",
     "scope": "global",
     "hardness": "absolute",
-    "related_to": [],
+    "related_to": [
+      "dec-010-407a",
+      "dec-019-c61a"
+    ],
     "tags": [
       "cost",
       "safety",
@@ -173,8 +176,8 @@
     "schema_version": 4,
     "status": "active",
     "created_at": "2026-08-17T01:10:40.672844+00:00",
-    "updated_at": "2026-08-17T01:10:40.672844+00:00",
-    "verified_at": "2026-08-17T01:10:40.672844+00:00",
-    "verified_sha": "e4b120847ebd081c13af46e7e1cb98636dc76aff"
+    "updated_at": "2026-08-17T03:12:37.235016+00:00",
+    "verified_at": "2026-08-17T03:12:37.213304+00:00",
+    "verified_sha": "b1deb2fbe77d2e0203a44699698a3ce3cef3fca4"
   }
 ]
