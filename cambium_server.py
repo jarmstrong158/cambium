@@ -4292,9 +4292,22 @@ def _project_snapshot(cfg, name, context_dir, pages, include_bodies,
         "supersession_edges": edges,
         "pages": page_rows,
         "stale_page_count": sum(1 for p in page_rows if p["stale"]),
-        "quality": _quality_gaps(os.path.dirname(context_dir), include_bodies),
+        "quality": _project_quality(cfg, name, context_dir, include_bodies, links),
         "links": _project_links(links, name, include_bodies),
     }
+
+
+def _project_quality(cfg, name, context_dir, include_bodies, links):
+    """verify_quality's gaps, plus whether a repair has already been asked for.
+
+    The awaiting set is read off `links` rather than re-reading decisions.json
+    per project: it is the same eval_pending list for every kind, and reading it
+    twenty times to answer one boolean would make the snapshot slower for no
+    additional truth."""
+    q = _quality_gaps(os.path.dirname(context_dir), include_bodies)
+    if "quality:%s" % name in ((links or {}).get("awaiting") or set()):
+        q["awaiting_repair"] = True
+    return q
 
 
 def _project_links(links, name, include_bodies):
