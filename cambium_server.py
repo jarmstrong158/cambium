@@ -4000,9 +4000,20 @@ LAW_TAG = "xylem-law"      # marks a cross-project concept page in the knowledge
 DECISIONS_FILE = "decisions.json"   # judgements made on the dashboard
 
 
+def _empty_decisions():
+    """One place for the shape, because three copies of a literal drift.
+
+    `link_evals` holds an agent's AUDIT of a proposal, keyed the same
+    project:newer:older as a dismissal. It is advisory by construction: a
+    verdict here changes what the reviewer reads, never what the store says.
+    The tap is still the gate."""
+    return {"dismissed_links": [], "law_citations": {}, "law_dismissed": {},
+            "link_evals": {}}
+
+
 def _read_decisions(cfg):
-    """Judgements the operator has already made — dismissed link proposals, and
-    per-law rulings on candidate evidence.
+    """Judgements the operator has already made — dismissed link proposals,
+    per-law rulings on candidate evidence, and agent audits awaiting a ruling.
 
     A review surface that re-proposes what you already rejected is worse than
     one that proposes nothing: it trains you to stop reading it. These are a
@@ -4010,17 +4021,16 @@ def _read_decisions(cfg):
     explicitly reversed."""
     path = os.path.join(os.path.dirname(cfg["local_store"]), DECISIONS_FILE)
     if not os.path.exists(path):
-        return {"dismissed_links": [], "law_citations": {}, "law_dismissed": {}}
+        return _empty_decisions()
     try:
         with open(path, encoding="utf-8") as f:
             d = json.load(f)
     except (OSError, json.JSONDecodeError):
-        return {"dismissed_links": [], "law_citations": {}, "law_dismissed": {}}
+        return _empty_decisions()
     if not isinstance(d, dict):
-        return {"dismissed_links": [], "law_citations": {}, "law_dismissed": {}}
-    d.setdefault("dismissed_links", [])
-    d.setdefault("law_citations", {})
-    d.setdefault("law_dismissed", {})
+        return _empty_decisions()
+    for key, default in _empty_decisions().items():
+        d.setdefault(key, default)
     return d
 
 
@@ -4212,9 +4222,11 @@ def _link_proposals(cfg):
     for u in data.get("unpaired_markers", []):
         if u.get("project") in named:
             unpaired.setdefault(u["project"], []).append(u)
+    decisions = _read_decisions(cfg)
     return {"checked": True, "proposals": out, "unpaired": unpaired,
             "threshold": data.get("threshold"),
-            "dismissed": _read_decisions(cfg)["dismissed_links"]}
+            "dismissed": decisions["dismissed_links"],
+            "evals": decisions["link_evals"]}
 
 
 def _project_snapshot(cfg, name, context_dir, pages, include_bodies,
@@ -4280,6 +4292,7 @@ def _project_links(links, name, include_bodies):
         return {"checked": False, "proposals": None,
                 "reason": (links or {}).get("reason", "not run")}
     dismissed = set(links.get("dismissed") or [])
+    evals = links.get("evals") or {}
     rows = []
     for prop in links.get("proposals", {}).get(name, []):
         key = "%s:%s:%s" % (name, prop.get("newer_id"), prop.get("older_id"))
@@ -4302,16 +4315,32 @@ def _project_links(links, name, include_bodies):
         if include_bodies:
             row["older_summary"] = _demojibake(prop.get("older_summary") or "")
             row["newer_summary"] = _demojibake(prop.get("newer_summary") or "")
+        verdict = evals.get(key)
+        if verdict:
+            # Carried WITH the proposal rather than as a separate list, so the
+            # reviewer reads the audit and the evidence in one place and cannot
+            # rule on one while looking at the other.
+            row["eval"] = {
+                "verdict": verdict.get("verdict"),
+                "confidence": verdict.get("confidence"),
+                "at": verdict.get("at"),
+                "model": verdict.get("model"),
+            }
+            if include_bodies:
+                row["eval"]["reasoning"] = _demojibake(
+                    verdict.get("reasoning") or "")[:1200]
         rows.append(row)
-    # Evidence first: a pair where the newer entry actually names the older
-    # beside change language, then everything that merely shares a subject.
-    rows.sort(key=lambda r: (r["tier"] != "likely", -(r["overlap_score"] or 0),
-                             r["older_id"] or ""))
+    # Audited first, then evidence: a pair someone has already done the reading
+    # on is the one worth a tap, and a `likely` with no audit still beats a
+    # `lead` with one.
+    rows.sort(key=lambda r: (not r.get("eval"), r["tier"] != "likely",
+                             -(r["overlap_score"] or 0), r["older_id"] or ""))
     return {
         "checked": True,
         "proposals": rows,
         "count": len(rows),
         "likely": sum(1 for r in rows if r["tier"] == "likely"),
+        "audited": sum(1 for r in rows if r.get("eval")),
         "both_signals": sum(1 for r in rows if r["both_signals"]),
         "unpaired_markers": len(links.get("unpaired", {}).get(name, [])),
         "note": "Proposals only. Nothing was written to any store — an edge "

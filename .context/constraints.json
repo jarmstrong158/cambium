@@ -146,5 +146,35 @@
     "updated_at": "2026-08-16T20:27:57.069769+00:00",
     "verified_at": "2026-08-16T20:27:57.031415+00:00",
     "verified_sha": "efd91c10daea3b8070115d381f7c966fb1404483"
+  },
+  {
+    "id": "con-006-1f03",
+    "rule": "NEVER spend the user's money. No metered API call, no billed CLI invocation (including `claude -p` / headless Claude Code), no paid service, no tokens purchased outside the interactive session the user is already paying for - not to build a feature, not to test one, not to inspect a response shape. If a design needs a paid call, say so and quote the price BEFORE writing the code, and do not present it as an option without its cost attached. Never put a billed call on a timer, a hook, or any unattended path.",
+    "reason": "Money leaves the user's account and does not come back, and an automated caller can do it repeatedly while nobody is watching. The specific failure was worse than the amount: a step that made a metered model call per item was wired into a scheduler firing every five minutes and shipped switched ON, which is a standing charge disguised as a feature. Cost is also invisible in a way bugs are not - nothing errors, nothing looks wrong, and the only signal is a bill arriving later.",
+    "triggering_incident": "Building a \"send for eval\" button, an agent audit step was implemented as `claude -p` invoked from the 5-minute drain. Three billed calls were made: two feature tests and - the indefensible one - a call whose entire purpose was to look at the shape of a JSON response envelope. Roughly $0.29 total, only $0.1442 of it actually recorded, because cost instrumentation was added AFTER the first spend. The user had been asked which trigger to use and picked the headless option from a list that never mentioned it cost money, so the choice was not informed consent; presenting a paid option without its price is the root failure, not the user's answer. Remediation: the runner was DELETED rather than gated, because a flag that can be flipped is not a guarantee. Sending a pair for eval still files a self-contained request; the reading happens in an interactive session that is already paid for.",
+    "enforced_by": "",
+    "scope": "global",
+    "hardness": "absolute",
+    "related_to": [],
+    "tags": [
+      "cost",
+      "safety",
+      "automation",
+      "absolute"
+    ],
+    "retrieval_hints": [
+      "can I use claude -p",
+      "is it ok to call the API for this",
+      "headless claude in a scheduled job",
+      "does this cost money",
+      "billed call in automation"
+    ],
+    "origin": "user",
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-08-17T01:10:40.672844+00:00",
+    "updated_at": "2026-08-17T01:10:40.672844+00:00",
+    "verified_at": "2026-08-17T01:10:40.672844+00:00",
+    "verified_sha": "e4b120847ebd081c13af46e7e1cb98636dc76aff"
   }
 ]
