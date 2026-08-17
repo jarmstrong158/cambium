@@ -4008,7 +4008,7 @@ def _empty_decisions():
     verdict here changes what the reviewer reads, never what the store says.
     The tap is still the gate."""
     return {"dismissed_links": [], "law_citations": {}, "law_dismissed": {},
-            "link_evals": {}, "law_evals": {}}
+            "link_evals": {}, "law_evals": {}, "eval_pending": []}
 
 
 def _read_decisions(cfg):
@@ -4132,6 +4132,10 @@ def _lessons_block(cfg, include_bodies, mesh):
                     e: v for e, v in (
                         (e, decided["law_evals"].get("%s:%s" % (item.get("id"), e)))
                         for e in unincorporated[:40]) if v},
+                # Same visibility problem as a link: filed, waiting on a reader.
+                "unincorporated_awaiting": [
+                    e for e in unincorporated[:40]
+                    if "%s:%s" % (item.get("id"), e) in set(decided["eval_pending"])],
                 # Single-tag matches, counted but not listed. Reported so the
                 # narrowing is visible rather than looking like there was
                 # nothing else there.
@@ -4234,7 +4238,8 @@ def _link_proposals(cfg):
     return {"checked": True, "proposals": out, "unpaired": unpaired,
             "threshold": data.get("threshold"),
             "dismissed": decisions["dismissed_links"],
-            "evals": decisions["link_evals"]}
+            "evals": decisions["link_evals"],
+            "awaiting": set(decisions["eval_pending"])}
 
 
 def _project_snapshot(cfg, name, context_dir, pages, include_bodies,
@@ -4323,6 +4328,11 @@ def _project_links(links, name, include_bodies):
         if include_bodies:
             row["older_summary"] = _demojibake(prop.get("older_summary") or "")
             row["newer_summary"] = _demojibake(prop.get("newer_summary") or "")
+        if key in (links.get("awaiting") or set()):
+            # Filed and waiting on a reader. Without this the card reverts to
+            # offering "Send for eval" again the moment the queue drains, and a
+            # successful tap is indistinguishable from one that did nothing.
+            row["awaiting_eval"] = True
         verdict = evals.get(key)
         if verdict:
             # Carried WITH the proposal rather than as a separate list, so the
