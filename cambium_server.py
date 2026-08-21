@@ -4342,8 +4342,19 @@ def _project_quality(cfg, name, context_dir, include_bodies, links):
     twenty times to answer one boolean would make the snapshot slower for no
     additional truth."""
     q = _quality_gaps(os.path.dirname(context_dir), include_bodies)
-    if "quality:%s" % name in ((links or {}).get("awaiting") or set()):
+    # Any quality request for this project, whatever bucket filed it. The
+    # bucket buttons file quality-review:<project> and quality-blocked:<project>
+    # while the per-project button files quality:<project>, so matching only the
+    # bare form left the mesh-wide sends invisible -- tap, refresh, nothing.
+    awaiting = (links or {}).get("awaiting") or set()
+    pending_cls = sorted({
+        (k.split(":", 1)[0].split("-", 1) + [""])[1] or "any"
+        for k in awaiting
+        if k.split(":", 1)[0].split("-", 1)[0] == "quality"
+        and k.split(":", 1)[-1] == name})
+    if pending_cls:
         q["awaiting_repair"] = True
+        q["awaiting_classes"] = pending_cls
 
     # Classify every issue so the card can say what a tap will DO, rather than
     # showing one total that never moves.
@@ -4720,6 +4731,57 @@ def setup(project_repo: str, agent_id: str, org_repo: str = "",
     return json.dumps(result, indent=2)
 
 
+# Words that appear in every repo and so separate nothing.
+_STOP = frozenset("""
+this that with from have been will your they them then than into more most some
+such only other same each about after before which while where when what
+python java script test tests main src lib code file files json yaml init
+update updates fix fixes add adds remove removes refactor docs doc readme
+""".split())
+
+
+def _work_terms(repo, limit=60):
+    """What this session is actually touching: paths in the working tree and the
+    subjects of recent commits.
+
+    This is the missing input. Ranking a knowledge digest by recall count alone
+    is self-sealing: an item that has never been recalled sorts last, gets cut by
+    the budget, is therefore never seen, and so is never recalled. The best-
+    written law in a store can be structurally invisible from the day it is
+    written. Relevance needs something to be relevant TO."""
+    terms = set()
+    try:
+        for args in (["status", "--porcelain"],
+                     ["log", "-8", "--format=%s"],
+                     ["diff", "--name-only", "HEAD~3..HEAD"]):
+            r = subprocess.run(["git", "-C", repo] + args, capture_output=True,
+                               text=True, timeout=GIT_TIMEOUT,
+                               env=_noninteractive_env())
+            if r.returncode != 0:
+                continue
+            for tok in re.split(r"[^A-Za-z0-9_]+", r.stdout.lower()):
+                if len(tok) >= 4 and tok not in _STOP and not tok.isdigit():
+                    terms.add(tok)
+            if len(terms) >= limit:
+                break
+    except Exception:
+        pass
+    return terms
+
+
+def _relevance(item, terms):
+    """How many distinct work terms this item mentions. Tags count double --
+    a tag is a deliberate index, a word in prose may be incidental."""
+    if not terms:
+        return 0
+    text = (_oneline(item.get("content", "")) + " "
+            + _oneline(item.get("why", ""))).lower()
+    tags = " ".join(str(t) for t in (item.get("tags") or [])).lower()
+    score = sum(1 for t in terms if t in text)
+    score += 2 * sum(1 for t in terms if t in tags)
+    return score
+
+
 @mcp.tool()
 def session_primer(limit: int = 8) -> str:
     """A compact digest of what's ALREADY known for this project — built to be
@@ -4748,12 +4810,41 @@ def session_primer(limit: int = 8) -> str:
         pass  # a primer is best-effort; a missing remote scope never fails it
     active = [(s, i) for s, i in pool if i.get("status") == "active"]
 
-    # rank by recalls desc, then most-recent — the cheapest "what mattered" signal
-    top = sorted(
+    # Two rankings, and the budget is SPLIT between them.
+    #
+    # Recalls alone is self-sealing: never-recalled items sort last, get cut, are
+    # never seen, and so are never recalled. Measured on this machine, 16 of 19
+    # org-scope laws sat at recalls=0 -- structurally invisible -- while the same
+    # session committed five mistakes those exact laws describe.
+    #
+    # So half the seats go to what has PROVEN useful (recalls), and half to what
+    # is relevant to the work in front of you right now (terms from the working
+    # tree and recent commits). Proven knowledge keeps its place; a law written
+    # yesterday for exactly today's problem can still get in.
+    by_recall = sorted(
         active,
         key=lambda si: (si[1].get("trust", {}).get("recalls", 0),
                         si[1].get("updated_at", "")),
-        reverse=True)[:limit]
+        reverse=True)
+
+    terms = _work_terms(cfg["repo"])
+    scored = [(si, _relevance(si[1], terms)) for si in active]
+    by_relevance = [si for si, sc in
+                    sorted(scored, key=lambda x: (x[1],
+                           x[0][1].get("trust", {}).get("recalls", 0)),
+                           reverse=True) if sc > 0]
+
+    reserved = max(1, limit // 2)
+    top, seen = [], set()
+    for si in by_relevance[:reserved]:
+        top.append(si)
+        seen.add(id(si[1]))
+    for si in by_recall:
+        if len(top) >= limit:
+            break
+        if id(si[1]) not in seen:
+            top.append(si)
+            seen.add(id(si[1]))
 
     # promoted assumptions whose premise may have died, oldest-verified first
     premises = [(s, i) for s, i in active if (i.get("valid_while") or "").strip()]
