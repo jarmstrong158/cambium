@@ -4245,8 +4245,58 @@ def _link_proposals(cfg):
                         if k not in set(decisions["repair_dismissed"])}}
 
 
+def _synthesis_gaps(name, entries, lessons):
+    """What this project knows that no law has taken up yet.
+
+    _lessons_block asks the law-centric question -- "what does THIS law fail to
+    cite?" -- and that is the right question for keeping a law current. It is
+    the wrong question for a project, because a project whose knowledge never
+    became a law appears in no law's work list at all: having no law to fall
+    behind reads exactly like having nothing to say.
+
+    So ask it from the other end. Split this project's active entries three
+    ways: CITED by some law, a CANDIDATE the law tier already surfaced, and
+    everything else -- entries no law cites and no law is even reaching for.
+    That last bucket is the project's unsynthesized knowledge, and it is the
+    only one of the three that nothing else in the mesh reports.
+
+    Arithmetic, all of it. Writing the law is judgement and stays with a person.
+    """
+    cited, candidate = {}, {}
+    laws_here = set()
+    for law in lessons.get("laws") or []:
+        lid = law.get("id")
+        for eid in law.get("cites") or []:
+            e = str(eid).lower()
+            cited.setdefault(e, []).append(lid)
+            laws_here.add(lid)
+        for eid in law.get("unincorporated") or []:
+            candidate.setdefault(str(eid).lower(), []).append(lid)
+
+    active = [e for e, r in entries.items()
+              if (r[2].get("status") or "active") == "active"]
+    feeding = sorted(e for e in active if e.lower() in cited)
+    pending = sorted(e for e in active
+                     if e.lower() not in cited and e.lower() in candidate)
+    orphan = sorted(e for e in active
+                    if e.lower() not in cited and e.lower() not in candidate)
+    laws_from_here = sorted({l for e in feeding for l in cited[e.lower()]})
+    return {
+        "active": len(active),
+        "feeding_laws": feeding,
+        "awaiting_incorporation": pending,
+        "unsynthesized": orphan,
+        "laws_drawing_on_this": laws_from_here,
+        "law_count": len(laws_from_here),
+        # The headline: of everything this project has settled, how much has
+        # reached the tier that other projects can read?
+        "generalized_pct": (round(100.0 * len(feeding) / len(active))
+                            if active else 0),
+    }
+
+
 def _project_snapshot(cfg, name, context_dir, pages, include_bodies,
-                      links=None):
+                      links=None, lessons=None):
     entries = _read_entries(context_dir)
     by_kind, by_status, by_kind_status, nodes, edges = {}, {}, {}, [], []
     for eid, rec in sorted(entries.items()):
@@ -4296,6 +4346,7 @@ def _project_snapshot(cfg, name, context_dir, pages, include_bodies,
         "pages": page_rows,
         "stale_page_count": sum(1 for p in page_rows if p["stale"]),
         "quality": _project_quality(cfg, name, context_dir, include_bodies, links),
+        "synthesis": _synthesis_gaps(name, entries, lessons or {}),
         "links": _project_links(links, name, include_bodies),
     }
 
@@ -4478,6 +4529,11 @@ def _build_snapshot(cfg, include_bodies=False):
 
     mesh = _mesh_index(cfg)
 
+    # Laws are computed BEFORE the projects that get measured against them: a
+    # project's synthesis gap is defined by what the law tier already covers, so
+    # the law tier has to exist first.
+    lessons = _lessons_block(cfg, include_bodies, mesh)
+
     projects, skipped = [], []
     for name in sorted(targets):
         ctx = targets[name]
@@ -4486,8 +4542,7 @@ def _build_snapshot(cfg, include_bodies=False):
             continue
         projects.append(_project_snapshot(cfg, name, ctx,
                                           pages_by_project.get(name, []),
-                                          include_bodies, links))
-    lessons = _lessons_block(cfg, include_bodies, mesh)
+                                          include_bodies, links, lessons))
     return {
         "schema": SNAPSHOT_SCHEMA,
         "generator": "cambium",
@@ -4512,6 +4567,16 @@ def _build_snapshot(cfg, include_bodies=False):
                 p["links"].get("likely") or 0 for p in projects),
             "projects_without_link_survey": sum(
                 1 for p in projects if not p["links"]["checked"]),
+            # The synthesis headline: projects that have settled real knowledge
+            # and generalized none of it. Counted only above a floor, because a
+            # project with three entries has not earned a law yet and flagging
+            # it would drown the ones that have.
+            "projects_generalizing_nothing": sum(
+                1 for p in projects
+                if p["synthesis"]["law_count"] == 0
+                and p["synthesis"]["active"] >= 10),
+            "unsynthesized_entries": sum(
+                len(p["synthesis"]["unsynthesized"]) for p in projects),
         },
     }
 

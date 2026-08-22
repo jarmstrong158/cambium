@@ -712,5 +712,43 @@
     "updated_at": "2026-08-17T00:43:53.043240+00:00",
     "verified_at": "2026-08-17T00:43:53.005745+00:00",
     "verified_sha": "be093c253ce920b86f840674f15e6d2b36d8d5f2"
+  },
+  {
+    "id": "dec-020-d7ba",
+    "summary": "Added a per-project synthesis-gap block to the snapshot and a Synthesis view to the dashboard, measuring coverage by which entries a law CITES rather than which project a law was distilled from. Replaced the linear supersession chain view with a layered DAG that draws every edge.",
+    "problem": "The mesh could report what synthesis EXISTS but never what was missing. The law tier's work list is law-centric \u2014 it asks what each law fails to cite \u2014 so a project whose knowledge never became a law appears in no work list at all: having no law to fall behind is indistinguishable from having nothing to say. Separately, the chains view walked single paths and silently dropped any edge that did not fit one, so two entries superseded by the same target lost a whole branch.",
+    "why_chosen": "Asking the coverage question from the project end makes the invisible case visible, and it is pure arithmetic: split a project's active entries into cited by a law, already surfaced as a law candidate, and neither. Only the third bucket is unreported elsewhere, and it is the actual work list. Writing the law stays judgement and stays with a person, reached through the same queue-and-approve path as repairs. For the graph, layering by longest path from a root draws merges and cycles instead of discarding them, so the view can no longer under-report the history it exists to show.",
+    "what_we_tried": "First measured coverage as \"entries no page cites as primary\" and found 3 of 423 \u2014 a dead signal, because compile_project makes a page per tag by construction, so mechanical synthesis can never have a gap. Then measured tag clusters of 4+ with no page: zero, for the same reason. Only the judgement-written tier can actually be missing, which is what moved the detector to the law tier.",
+    "tradeoffs": "Coverage counts a law's cited ids, so a law that draws on a project without naming an entry id reads as no coverage. The candidate bucket also inherits _lessons_block's 40-item truncation, so a project past that cap can show entries as unsynthesized that a law is in fact reaching for. Both understate coverage rather than overstate it, which is the safe direction for a work list.",
+    "alternatives": [],
+    "constraints_created": [
+      "A sweep that decides whether a filed request is finished must dispatch on the request's eval_kind, never on the presence of an entries list."
+    ],
+    "related_to": [
+      "dec-018-0a86",
+      "dec-014-f951",
+      "dec-017-a425"
+    ],
+    "tags": [
+      "dashboard",
+      "synthesis",
+      "pages",
+      "cambium",
+      "supersession",
+      "law-tier"
+    ],
+    "retrieval_hints": [
+      "why does a project with no law show as having nothing to say",
+      "how is missing synthesis detected per project",
+      "supersession graph drops edges"
+    ],
+    "origin": "agent",
+    "schema_version": 4,
+    "status": "active",
+    "superseded_by": null,
+    "created_at": "2026-08-22T12:17:43.167359+00:00",
+    "updated_at": "2026-08-22T12:17:43.167359+00:00",
+    "verified_at": "2026-08-22T12:17:43.167359+00:00",
+    "verified_sha": "d64ac98851cb20ea7507609c075ee9692043410e"
   }
 ]

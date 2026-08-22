@@ -56,7 +56,10 @@
     "enforced_by": "test_cambium.py::test_real_agentsync_integration",
     "scope": "test_cambium.py",
     "hardness": "absolute",
-    "related_to": [],
+    "related_to": [
+      "dec-010-407a",
+      "dec-012-7c40"
+    ],
     "tags": [
       "mcp",
       "protocol-migration",
@@ -75,9 +78,9 @@
     "schema_version": 4,
     "status": "active",
     "created_at": "2026-07-31T17:37:42.279430+00:00",
-    "updated_at": "2026-07-31T17:37:42.279430+00:00",
-    "verified_at": "2026-07-31T17:37:42.279430+00:00",
-    "verified_sha": "cfdf09e5b53f449e6b51dd3923bf8d9b427d43bb"
+    "updated_at": "2026-08-17T20:39:04.267172+00:00",
+    "verified_at": "2026-08-17T20:39:04.241726+00:00",
+    "verified_sha": "54018a555d32ab5c3b655cf117b296d6573d7dfa"
   },
   {
     "id": "con-004-e3b9",
@@ -108,9 +111,9 @@
     "schema_version": 4,
     "status": "active",
     "created_at": "2026-08-16T17:50:23.428579+00:00",
-    "updated_at": "2026-08-16T17:51:16.730666+00:00",
-    "verified_at": "2026-08-16T17:51:16.693169+00:00",
-    "verified_sha": "603d6be33d2ba54214c47c9337c41a55203dc764"
+    "updated_at": "2026-08-17T20:29:05.822991+00:00",
+    "verified_at": "2026-08-17T20:29:05.798585+00:00",
+    "verified_sha": "54018a555d32ab5c3b655cf117b296d6573d7dfa"
   },
   {
     "id": "con-005-22d0",
@@ -179,5 +182,36 @@
     "updated_at": "2026-08-17T03:12:37.235016+00:00",
     "verified_at": "2026-08-17T03:12:37.213304+00:00",
     "verified_sha": "b1deb2fbe77d2e0203a44699698a3ce3cef3fca4"
+  },
+  {
+    "id": "con-007-3a6c",
+    "rule": "A service worker must serve the DOCUMENT network-first, never cache-first, and any claim that a UI change is live must be verified by loading the deployed URL and interacting with it - never by calling a render function in a console against a local server. index.html is the only cached URL that is not content-versioned, and it names which versioned assets the page loads, so caching it pins a client to that shell permanently.",
+    "reason": "Cache-first on the document defeats every cache-busting mechanism at once: the stale index keeps requesting the old asset URLs, so bumping the query string and renaming the shell cache both do nothing. It fails in the most deceiving way available when data is fetched network-first - the numbers keep moving while the interface never changes, so the deploy looks live, reloading does not help, and the user reasonably concludes the app is broken rather than stale.</reason>\n<parameter name=\"triggering_incident\">A live client served interface build 4 through thirteen version bumps. Every UI change made in a full day of work - eval verdicts, the recommended-button highlighting, bulk action bars, repair proposals, the actionability buckets - deployed correctly to Cloudflare and never reached the phone. The user reported \"I don't see it on the dash\" four separate times and was correct every time; each answer explained the feature instead of checking whether it had arrived. It was only found by loading the deployed token URL in a browser and reading the script src, which said app.js?v=4. The verification habit was the real defect: every check had been a console call to renderQuality() with queueAvailable stubbed, against a local static server that runs no service worker, which exercises the function and proves nothing about the app.",
+    "triggering_incident": "A live client served interface build 4 through thirteen version bumps. Every UI change made in a full day of work - eval verdicts, the recommended-button highlighting, bulk action bars, repair proposals, the actionability buckets - deployed correctly to Cloudflare and never reached the phone. The user reported \"I don't see it on the dash\" four separate times and was correct every time; each answer explained the feature instead of checking whether it had arrived. It was only found by loading the deployed token URL in a browser and reading the script src, which said app.js with the version query still at 4. The verification habit was the real defect: every check had been a console call to renderQuality() with queueAvailable stubbed, against a local static server that runs no service worker, which exercises the function and proves nothing about the app.",
+    "enforced_by": "manual: load the deployed URL, read the interface build number now shown in the footer",
+    "scope": "global",
+    "hardness": "absolute",
+    "related_to": [],
+    "tags": [
+      "service-worker",
+      "caching",
+      "verification",
+      "deploy",
+      "pwa"
+    ],
+    "retrieval_hints": [
+      "why does the dashboard not show my changes",
+      "deployed but UI is stale",
+      "service worker serving old app.js",
+      "cache busting not working",
+      "how do I verify a UI change is actually live"
+    ],
+    "origin": "user",
+    "schema_version": 4,
+    "status": "active",
+    "created_at": "2026-08-17T15:21:32.134909+00:00",
+    "updated_at": "2026-08-17T20:29:06.120548+00:00",
+    "verified_at": "2026-08-17T20:29:06.095769+00:00",
+    "verified_sha": "54018a555d32ab5c3b655cf117b296d6573d7dfa"
   }
 ]

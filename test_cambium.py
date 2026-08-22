@@ -2752,3 +2752,43 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def test_synthesis_splits_entries_into_cited_candidate_and_orphan():
+    """A project's unsynthesized bucket is the one nothing else reports.
+
+    The law tier's own work list is law-centric, so a project whose knowledge
+    never became a law appears in no work list at all. This is the check that
+    such a project is still visible.
+    """
+    entries = {
+        "dec-001": ("decisions", "t", {"status": "active"}),
+        "dec-002": ("decisions", "t", {"status": "active"}),
+        "dec-003": ("decisions", "t", {"status": "active"}),
+        "dec-004": ("decisions", "t", {"status": "superseded"}),
+    }
+    lessons = {"laws": [
+        {"id": "k-aaa", "cites": ["dec-001"], "unincorporated": ["dec-002"]},
+    ]}
+    g = M._synthesis_gaps("proj", entries, lessons)
+    assert g["feeding_laws"] == ["dec-001"]
+    assert g["awaiting_incorporation"] == ["dec-002"]
+    assert g["unsynthesized"] == ["dec-003"], "orphan must be named, not dropped"
+    assert "dec-004" not in g["unsynthesized"], "superseded entries are not work"
+    assert g["active"] == 3
+    assert g["laws_drawing_on_this"] == ["k-aaa"]
+    assert g["generalized_pct"] == 33
+
+
+def test_synthesis_flags_a_project_that_generalized_nothing():
+    entries = {"dec-%03d" % i: ("decisions", "t", {"status": "active"})
+               for i in range(12)}
+    g = M._synthesis_gaps("proj", entries, {"laws": []})
+    assert g["law_count"] == 0
+    assert g["generalized_pct"] == 0
+    assert len(g["unsynthesized"]) == 12
+
+
+def test_synthesis_survives_a_mesh_with_no_law_tier_at_all():
+    g = M._synthesis_gaps("proj", {}, {})
+    assert g["active"] == 0 and g["generalized_pct"] == 0
